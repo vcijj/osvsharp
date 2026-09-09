@@ -180,7 +180,7 @@ static void cmd_addf(Cmd *c, const wchar_t *fmt, ...) {
 
 typedef struct { HANDLE r; PROCESS_INFORMATION pi; } Child;
 
-static int spawn(const wchar_t *cmdline, Child *c, int mute_stderr) {
+static int spawn(const wchar_t *cmdline, Child *c, int stderr_mode) {
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE rh, wh;
     if (!CreatePipe(&rh, &wh, &sa, 0)) return -1;
@@ -191,7 +191,9 @@ static int spawn(const wchar_t *cmdline, Child *c, int mute_stderr) {
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = wh;
-    si.hStdError = mute_stderr ? NULL : GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdError = stderr_mode == 2 ? wh
+                 : stderr_mode == 1 ? NULL
+                 : GetStdHandle(STD_ERROR_HANDLE);
     si.hStdInput = NULL; /* every ffmpeg call passes -nostdin */
 
     wchar_t *cl = _wcsdup(cmdline);
@@ -803,6 +805,281 @@ static void remove_selected(void) {
     }
 }
 
+/* ------------------------------------------------------------ preview ----
+ * Double-click a list row: 12 thumbnails sampled at evenly spaced
+ * timestamps (-ss + one decoded frame each, so it is fast at any
+ * resolution), composed into an in-memory bitmap -- no temp files. */
+
+#define _PV_WSTR2(x) L#x
+#define _PV_WSTR(x) _PV_WSTR2(x)
+
+#define PV_COLS 4
+#define PV_ROWS 3
+#define PV_TW   200
+#define PV_TH   150
+#define PV_NT   (PV_COLS * PV_ROWS)
+
+#define APP_PVPROG (WM_APP + 5)   /* wParam: tiles done */
+#define APP_PVDONE (WM_APP + 6)   /* wParam: 1 = complete */
+
+typedef struct {
+    wchar_t path[MAX_PATH * 2];
+    wchar_t name[MAX_PATH];
+    wchar_t info[256];        /* info line under the title bar          */
+    uint8_t *grid;            /* (PV_COLS*PV_TW)x(PV_ROWS*PV_TH) bgr24  */
+    int done, ready;
+    volatile int cancel;
+} Preview;
+
+static Preview g_pv;
+static HWND g_hwnd_pv;
+static HANDLE g_pv_thread;
+static HANDLE g_pv_child;
+static wchar_t *g_ffmpeg;     /* cached find_ffmpeg() result            */
+
+static void pv_kill_child(void) {
+    HANDLE ch = (HANDLE)InterlockedExchangePointer(
+        (void *volatile *)&g_pv_child, NULL);
+    if (ch) TerminateProcess(ch, 1);
+}
+
+/* run ffmpeg -i <path> (no output) and parse duration/streams from stderr */
+static int pv_probe_info(const wchar_t *path, double *dur, int *vw, int *vh,
+                         int *nvstreams) {
+    Cmd c = {0};
+    cmd_add(&c, g_ffmpeg ? g_ffmpeg : L"ffmpeg");
+    cmd_add(&c, L"-nostdin");
+    cmd_add(&c, L"-i");
+    cmd_add(&c, path);
+    Child ch;
+    if (spawn(c.s, &ch, 2) != 0) { free(c.s); return -1; }
+    free(c.s);
+    pv_kill_child();
+    InterlockedExchangePointer((void *volatile *)&g_pv_child, ch.pi.hProcess);
+
+    size_t len = 0, cap = 65536;
+    char *buf = malloc(cap);
+    for (;;) {
+        if (len == cap) { cap *= 2; buf = realloc(buf, cap); }
+        DWORD got = 0;
+        if (!ReadFile(ch.r, buf + len, (DWORD)(cap - len), &got, NULL) || got == 0)
+            break;
+        len += got;
+    }
+    buf[len < cap ? len : cap - 1] = 0;
+    child_wait(&ch);
+
+    int ok = 0;
+    *dur = 0; *vw = *vh = 0; *nvstreams = 0;
+    const char *p = strstr(buf, "Duration: ");
+    if (p) {
+        int h = 0, m = 0;
+        double s = 0;
+        if (sscanf(p + 10, "%d:%d:%lf", &h, &m, &s) == 3) {
+            *dur = h * 3600.0 + m * 60.0 + s;
+            ok = 1;
+        }
+    }
+    p = buf;
+    while ((p = strstr(p, "Video: ")) != NULL) {
+        (*nvstreams)++;
+        if (*vw == 0) {
+            const char *q = p;
+            while (*q && *q != '\n') {
+                int w, h;
+                if (sscanf(q, ", %dx%d", &w, &h) == 2 && w > 0) {
+                    *vw = w; *vh = h;
+                    break;
+                }
+                q++;
+            }
+        }
+        p += 7;
+    }
+    free(buf);
+    return ok ? 0 : -1;
+}
+
+/* fetch one 200x150 bgr24 thumbnail at time t; 0 ok */
+static int pv_fetch_tile(const wchar_t *path, double t, uint8_t *dst) {
+    Cmd c = {0};
+    cmd_add(&c, g_ffmpeg ? g_ffmpeg : L"ffmpeg");
+    cmd_add(&c, L"-nostdin");
+    cmd_add(&c, L"-v");
+    cmd_add(&c, L"error");
+    wchar_t ssbuf[32];
+    swprintf(ssbuf, 32, L"%.3f", t);
+    cmd_add2(&c, L"-ss", ssbuf);
+    cmd_add(&c, L"-i");
+    cmd_add(&c, path);
+    cmd_add(&c, L"-map");
+    cmd_add(&c, L"0:v:0");
+    cmd_add(&c, L"-frames:v");
+    cmd_add(&c, L"1");
+    cmd_add(&c, L"-fps_mode");
+    cmd_add(&c, L"passthrough");
+    cmd_add(&c, L"-vf");
+    cmd_add(&c, L"scale=" _PV_WSTR(PV_TW) L":" _PV_WSTR(PV_TH)
+                  L":force_original_aspect_ratio=decrease,pad="
+                  _PV_WSTR(PV_TW) L":" _PV_WSTR(PV_TH)
+                  L":(ow-iw)/2:(oh-ih)/2,format=bgr24");
+    cmd_add(&c, L"-f");
+    cmd_add(&c, L"rawvideo");
+    cmd_add(&c, L"pipe:1");
+    Child ch;
+    if (spawn(c.s, &ch, 1) != 0) { free(c.s); return -1; }
+    free(c.s);
+    pv_kill_child();
+    InterlockedExchangePointer((void *volatile *)&g_pv_child, ch.pi.hProcess);
+
+    int ok = read_exact(ch.r, dst, (size_t)PV_TW * PV_TH * 3);
+    child_wait(&ch);
+    return ok ? 0 : -1;
+}
+
+static DWORD WINAPI pv_worker(LPVOID param) {
+    (void)param;
+    double dur = 0;
+    int vw = 0, vh = 0, nv = 0;
+    if (pv_probe_info(g_pv.path, &dur, &vw, &vh, &nv) != 0) {
+        wcscpy(g_pv.info, L"无法读取该文件（不是视频或已损坏）");
+        if (g_hwnd_pv) PostMessage(g_hwnd_pv, APP_PVDONE, 0, 0);
+        return 0;
+    }
+    if (dur <= 0) dur = 60.0;
+
+    wchar_t timebuf[32];
+    _snwprintf(timebuf, 32, L"%d:%05.2f", (int)(dur / 60), dur - 60 * (int)(dur / 60));
+    _snwprintf(g_pv.info, 256,
+               L"时长 %s   分辨率 %dx%d   %s   双击其他行可切换预览",
+               timebuf, vw, vh, nv >= 2 ? L"双目全景（cam0 + cam1）" : L"单路视频");
+
+    free(g_pv.grid);
+    g_pv.grid = NULL;
+    g_pv.grid = calloc((size_t)PV_TW * PV_TH * 3, PV_COLS * PV_ROWS);
+    g_pv.done = 0;
+    for (int i = 0; i < PV_NT; i++) {
+        if (g_pv.cancel) break;
+        double t = dur * (i + 0.5) / PV_NT;
+        uint8_t *tile = malloc((size_t)PV_TW * PV_TH * 3);
+        if (pv_fetch_tile(g_pv.path, t, tile) == 0) {
+            int col = i % PV_COLS, row = i / PV_COLS;
+            uint8_t *dst = g_pv.grid +
+                (((size_t)row * PV_TH) * PV_COLS * PV_TW + (size_t)col * PV_TW) * 3;
+            /* copy row by row: tile rows are contiguous, grid rows are
+             * PV_COLS*PV_TW*3 bytes apart */
+            for (int y = 0; y < PV_TH; y++)
+                memcpy(dst + (size_t)y * PV_COLS * PV_TW * 3,
+                       tile + (size_t)y * PV_TW * 3,
+                       (size_t)PV_TW * 3);
+            g_pv.done = i + 1;
+            if (g_hwnd_pv) PostMessage(g_hwnd_pv, APP_PVPROG, i + 1, 0);
+        }
+        free(tile);
+    }
+    if (g_hwnd_pv) PostMessage(g_hwnd_pv, APP_PVDONE, 1, 0);
+    return 0;
+}
+
+static void pv_paint(HWND wnd) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(wnd, &ps);
+    RECT rc;
+    GetClientRect(wnd, &rc);
+    FillRect(dc, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
+    SetBkMode(dc, TRANSPARENT);
+    SelectObject(dc, g_font);
+
+    RECT rinfo = { 10, 8, rc.right - 10, 34 };
+    DrawTextW(dc, g_pv.name, -1, &rinfo,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT rinfo2 = { 10, 34, rc.right - 10, 56 };
+    DrawTextW(dc, g_pv.info, -1, &rinfo2,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    int gx = 8, gy = 62;
+    int gw = PV_COLS * PV_TW, gh = PV_ROWS * PV_TH;
+    if (g_pv.grid) {
+        BITMAPINFO bi;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = gw;
+        bi.bmiHeader.biHeight = -gh; /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 24;
+        bi.bmiHeader.biSizeImage = (DWORD)(gw * gh * 3);
+        StretchDIBits(dc, gx, gy, gw, gh, 0, 0, gw, gh, g_pv.grid, &bi,
+                      DIB_RGB_COLORS, SRCCOPY);
+    }
+    if (!g_pv.ready) {
+        wchar_t st[64];
+        _snwprintf(st, 64, L"正在生成预览…  %d/%d", g_pv.done, PV_NT);
+        RECT rcst = { gx, gy + gh / 2 - 12, gx + gw, gy + gh / 2 + 12 };
+        SetTextColor(dc, RGB(90, 90, 90));
+        DrawTextW(dc, st, -1, &rcst, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    EndPaint(wnd, &ps);
+}
+
+static LRESULT CALLBACK pv_wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: pv_paint(wnd); return 0;
+    case WM_ERASEBKGND: return 1;
+    case APP_PVPROG:
+        g_pv.done = (int)wp;
+        InvalidateRect(wnd, NULL, FALSE);
+        return 0;
+    case APP_PVDONE:
+        g_pv.ready = 1;
+        InvalidateRect(wnd, NULL, FALSE);
+        return 0;
+    case WM_DESTROY:
+        g_pv.cancel = 1;
+        pv_kill_child();
+        g_hwnd_pv = NULL;
+        return 0;
+    }
+    return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+static void start_preview(int idx) {
+    /* cancel a previous preview generation and let it finish */
+    if (g_pv_thread) {
+        g_pv.cancel = 1;
+        pv_kill_child();
+        WaitForSingleObject(g_pv_thread, 10000);
+        CloseHandle(g_pv_thread);
+        g_pv_thread = NULL;
+    }
+    g_pv.cancel = 0;
+    g_pv.done = 0;
+    g_pv.ready = 0;
+    wcscpy(g_pv.path, g_paths[idx]);
+    const wchar_t *base = wcsrchr(g_pv.path, L'\\');
+    base = base ? base + 1 : g_pv.path;
+    wcsncpy(g_pv.name, base, 255); g_pv.name[255] = 0;
+    wcscpy(g_pv.info, L"");
+
+    if (!g_hwnd_pv) {
+        RECT wr = { 0, 0, PV_COLS * PV_TW + 16, PV_ROWS * PV_TH + 70 };
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        g_hwnd_pv = CreateWindowW(L"OsvSharpPreview",
+                                  L"视频预览",
+                                  WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT,
+                                  wr.right - wr.left, wr.bottom - wr.top,
+                                  g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        ShowWindow(g_hwnd_pv, SW_SHOW);
+    } else {
+        SetWindowTextW(g_hwnd_pv, L"视频预览");
+        ShowWindow(g_hwnd_pv, SW_SHOW);
+        SetForegroundWindow(g_hwnd_pv);
+    }
+    InvalidateRect(g_hwnd_pv, NULL, TRUE);
+    UpdateWindow(g_hwnd_pv);
+    g_pv_thread = CreateThread(NULL, 0, pv_worker, NULL, 0, NULL);
+}
+
 static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -864,6 +1141,14 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             list_add(path);
         }
         DragFinish(drop);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        NMHDR *nm = (NMHDR *)lp;
+        if (nm->idFrom == IDC_LIST && nm->code == (UINT)NM_DBLCLK) {
+            NMITEMACTIVATE *ia = (NMITEMACTIVATE *)lp;
+            if (ia->iItem >= 0 && ia->iItem < g_npaths) start_preview(ia->iItem);
+        }
         return 0;
     }
     case WM_COMMAND:
@@ -947,8 +1232,12 @@ static int gui_run(void) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"OsvSharpWnd";
     RegisterClassW(&wc);
-    g_hwnd = CreateWindowW(wc.lpszClassName,
-                           L"osvsharp — OSV 视频清晰帧批量提取",
+    wc.lpfnWndProc = pv_wndproc;
+    wc.lpszClassName = L"OsvSharpPreview";
+    RegisterClassW(&wc);
+    g_ffmpeg = find_ffmpeg(NULL);
+    g_hwnd = CreateWindowW(L"OsvSharpWnd",
+                           L"osvsharp — OSV 清晰帧批量提取（双击列表项预览）",
                            WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT, 1000, 680,
                            NULL, NULL, wc.hInstance, NULL);
