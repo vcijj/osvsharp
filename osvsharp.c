@@ -937,11 +937,32 @@ static int pv_fetch_tile(const wchar_t *path, double t, uint8_t *dst) {
     return ok ? 0 : -1;
 }
 
+/* DJI's preview trick: the .LRF beside an .OSV is a low-res stitched
+ * proxy (2048x1024 h264) -- preview from it when it exists. */
+static wchar_t *pv_lrf_path(const wchar_t *video) {
+    const wchar_t *dot = wcsrchr(video, L'.');
+    const wchar_t *slash = wcsrchr(video, L'\\');
+    if (!dot || (slash && dot < slash)) return NULL;
+    static const wchar_t *exts[] = { L"LRF", L"lrf", NULL };
+    for (int i = 0; exts[i]; i++) {
+        size_t n = (size_t)(dot - video) + 8;
+        wchar_t *cand = malloc(n * sizeof(wchar_t));
+        _snwprintf(cand, n, L"%.*ls.%ls", (int)(dot - video), video, exts[i]);
+        DWORD attr = GetFileAttributesW(cand);
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            return cand;
+        free(cand);
+    }
+    return NULL;
+}
+
 static DWORD WINAPI pv_worker(LPVOID param) {
     (void)param;
+    wchar_t *lrf = pv_lrf_path(g_pv.path);
+    const wchar_t *pvs = lrf ? lrf : g_pv.path;   /* preview source */
     double dur = 0;
     int vw = 0, vh = 0, nv = 0;
-    if (pv_probe_info(g_pv.path, &dur, &vw, &vh, &nv) != 0) {
+    if (pv_probe_info(pvs, &dur, &vw, &vh, &nv) != 0) {
         wcscpy(g_pv.info, L"无法读取该文件（不是视频或已损坏）");
         if (g_hwnd_pv) PostMessage(g_hwnd_pv, APP_PVDONE, 0, 0);
         return 0;
@@ -951,8 +972,10 @@ static DWORD WINAPI pv_worker(LPVOID param) {
     wchar_t timebuf[32];
     _snwprintf(timebuf, 32, L"%d:%05.2f", (int)(dur / 60), dur - 60 * (int)(dur / 60));
     _snwprintf(g_pv.info, 256,
-               L"时长 %s   分辨率 %dx%d   %s   双击其他行可切换预览",
-               timebuf, vw, vh, nv >= 2 ? L"双目全景（cam0 + cam1）" : L"单路视频");
+               L"时长 %s   分辨率 %dx%d   %s%s   双击其他行可切换预览",
+               timebuf, vw, vh,
+               nv >= 2 ? L"双目全景（cam0 + cam1）" : L"单路视频",
+               lrf ? L"   [LRF 低清代理]" : L"");
 
     free(g_pv.grid);
     g_pv.grid = NULL;
@@ -962,7 +985,7 @@ static DWORD WINAPI pv_worker(LPVOID param) {
         if (g_pv.cancel) break;
         double t = dur * (i + 0.5) / PV_NT;
         uint8_t *tile = malloc((size_t)PV_TW * PV_TH * 3);
-        if (pv_fetch_tile(g_pv.path, t, tile) == 0) {
+        if (pv_fetch_tile(pvs, t, tile) == 0) {
             int col = i % PV_COLS, row = i / PV_COLS;
             uint8_t *dst = g_pv.grid +
                 (((size_t)row * PV_TH) * PV_COLS * PV_TW + (size_t)col * PV_TW) * 3;
@@ -978,6 +1001,7 @@ static DWORD WINAPI pv_worker(LPVOID param) {
         free(tile);
     }
     if (g_hwnd_pv) PostMessage(g_hwnd_pv, APP_PVDONE, 1, 0);
+    free(lrf);
     return 0;
 }
 
