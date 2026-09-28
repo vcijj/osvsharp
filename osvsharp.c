@@ -732,6 +732,7 @@ static wchar_t *make_mask_png(int w, int h, int pct, int track) {
 #define APP_STATUS   (WM_APP + 2)   /* wParam: malloc'd StatusMsg */
 #define APP_FDONE    (WM_APP + 3)   /* wParam: malloc'd {idx, rc} */
 #define APP_ALLDONE  (WM_APP + 4)
+#define APP_TESTDONE (WM_APP + 7)   /* 涂黑测试：对比大图就绪 */
 
 #define IDC_LIST     1001
 #define IDC_LOG      1002
@@ -748,6 +749,7 @@ static wchar_t *make_mask_png(int w, int h, int pct, int track) {
 #define IDC_B_STOP   1025
 #define IDC_B_BROWSE 1026
 #define IDC_B_HELP   1027
+#define IDC_B_TEST   1028
 #define IDC_PBAR     1031
 /* 参数框下方的灰色小提示文本（WM_CTLCOLORSTATIC 里按此 ID 段置灰） */
 #define IDC_HINT_SKIP 1041
@@ -763,6 +765,9 @@ typedef struct { int idx, rc; } DoneMsg;
 /* defined in the CLI/main section below */
 static wchar_t *find_ffmpeg(const wchar_t *ffmpeg_arg);
 static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem);
+static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
+                               int *idx, int *ws, int *hs, int maxn,
+                               int *nattach);
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
                          double min_score, int track, int thumb, int jpeg_q,
@@ -931,9 +936,10 @@ static void layout(HWND wnd) {
     MoveWindow(GetDlgItem(wnd, IDC_B_REM), 105, y, 90, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_CLEAR), 200, y, 60, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_HELP), 265, y, 90, 26, TRUE);
+    MoveWindow(GetDlgItem(wnd, IDC_B_TEST), 360, y, 100, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_START), w - 180, y, 80, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_STOP), w - 90, y, 80, 26, TRUE);
-    MoveWindow(g_pbar, 365, y + 4, w - 555, 18, TRUE);
+    MoveWindow(g_pbar, 470, y + 4, w - 660, 18, TRUE);
     y += 36;
     int lh = (h - y) * 45 / 100;
     MoveWindow(g_list, 10, y, w - 20, lh, TRUE);
@@ -1312,6 +1318,335 @@ static void start_preview(int idx) {
     g_pv_thread = CreateThread(NULL, 0, pv_worker, NULL, 0, NULL);
 }
 
+/* ------------------------------------------------------------ 涂黑测试 ----
+ * 提取所选视频每一路的第一帧，按 85~99% 各涂黑一版拼成对比大图展示；
+ * 点击任意一格即把主窗口「涂黑%」输入框设为该值，由用户定涂黑范围。 */
+
+#define TEST_COLS   5
+#define TEST_NPCT   15              /* 85..99 */
+#define TEST_TW     600             /* 单格宽（px） */
+#define TEST_HEADER 40              /* 每路区段标题条高度 */
+#define TEST_GAP    6
+
+typedef struct {
+    uint8_t *sheet;       /* bgr24 对比大图 */
+    int w, h;
+    int tile_h;           /* 单格高（按源帧纵横比） */
+    int sec_h;            /* 每路区段高度 */
+    int tracks;           /* 1 = 单路, 2 = 双目 */
+} TestSheet;
+
+static TestSheet g_test;
+static HWND g_hwnd_test;
+static HANDLE g_test_thread;
+static int g_test_scroll, g_test_failed;
+static double g_test_scale = 1.0;
+
+static void test_free_sheet(void) {
+    free(g_test.sheet);
+    memset(&g_test, 0, sizeof(g_test));
+}
+
+/* 与 pass_b 滤镜同一几何：圆心=画面中心，保留半径=pct%×短边÷2，1.5px AA */
+static void mask_circle_bgr(uint8_t *img, int w, int h, int pct) {
+    double cx = w * 0.5, cy = h * 0.5;
+    double r = pct * 0.01 * (double)(w < h ? w : h) * 0.5;
+    size_t rb = (size_t)w * 3;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = img + (size_t)y * rb;
+        double dy = y + 0.5 - cy, dy2 = dy * dy;
+        for (int x = 0; x < w; x++) {
+            double dx = x + 0.5 - cx;
+            double d = sqrt(dx * dx + dy2);
+            double a = (d <= r - 1.5) ? 1.0 : (d >= r) ? 0.0 : (r - d) / 1.5;
+            uint8_t *px = row + (size_t)x * 3;
+            px[0] = (uint8_t)(px[0] * a);
+            px[1] = (uint8_t)(px[1] * a);
+            px[2] = (uint8_t)(px[2] * a);
+        }
+    }
+}
+
+static void downscale_bgr(const uint8_t *src, int sw, int sh,
+                          uint8_t *dst, int dw, int dh, int stride) {
+    for (int dy = 0; dy < dh; dy++) {
+        int y0 = (int)((long long)dy * sh / dh);
+        int y1 = (int)((long long)(dy + 1) * sh / dh);
+        if (y1 <= y0) y1 = y0 + 1;
+        uint8_t *out = dst + (size_t)dy * stride;
+        for (int dx = 0; dx < dw; dx++) {
+            int x0 = (int)((long long)dx * sw / dw);
+            int x1 = (int)((long long)(dx + 1) * sw / dw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned b = 0, g = 0, r = 0;
+            for (int y = y0; y < y1; y++) {
+                const uint8_t *row = src + ((size_t)y * sw + x0) * 3;
+                for (int x = x0; x < x1; x++, row += 3) {
+                    b += row[0]; g += row[1]; r += row[2];
+                }
+            }
+            unsigned n = (unsigned)((y1 - y0) * (x1 - x0));
+            out[dx * 3 + 0] = (uint8_t)(b / n);
+            out[dx * 3 + 1] = (uint8_t)(g / n);
+            out[dx * 3 + 2] = (uint8_t)(r / n);
+        }
+    }
+}
+
+static DWORD WINAPI test_worker(LPVOID argp) {
+    wchar_t *path = (wchar_t *)argp;
+    wchar_t *ffmpeg = find_ffmpeg(NULL);
+    TestSheet ts;
+    memset(&ts, 0, sizeof(ts));
+    int idx[4], ws[4], hs[4], nattach = 0;
+    int nreal = probe_video_streams(ffmpeg, path, idx, ws, hs, 4, &nattach);
+    int ntracks = nreal > 0 ? (nreal > 2 ? 2 : nreal) : 1;
+    int failed = 0;
+    if (nreal <= 0 || ws[0] <= 0 || hs[0] <= 0) {
+        LOG("[涂黑测试] 无法从文件头解析视频流分辨率\n");
+        failed = 1;
+    } else {
+        ts.tile_h = (int)((double)TEST_TW * hs[0] / ws[0] + 0.5);
+        ts.w = TEST_COLS * TEST_TW;
+        ts.sec_h = TEST_HEADER + 3 * ts.tile_h + 2 * TEST_GAP;
+        ts.h = ts.sec_h * ntracks;
+        ts.tracks = ntracks;
+        ts.sheet = calloc((size_t)ts.w * ts.h, 3);
+        if (!ts.sheet) { LOG("[涂黑测试] 内存不足\n"); failed = 1; }
+    }
+    for (int ti = 0; ti < ntracks && !failed; ti++) {
+        char b[160];
+        sprintf(b, "[涂黑测试] 提取 cam%d 第一帧（%dx%d）…\n", ti, ws[ti], hs[ti]);
+        LOG("%s", b);
+        Cmd c = {0};
+        cmd_add(&c, ffmpeg);
+        cmd_add(&c, L"-v"); cmd_add(&c, L"error"); cmd_add(&c, L"-nostdin");
+        cmd_add(&c, L"-i"); cmd_add(&c, path);
+        wchar_t mapspec[16]; swprintf(mapspec, 16, L"0:v:%d",
+                                      nreal > 0 ? idx[ti] : ti);
+        cmd_add2(&c, L"-map", mapspec);
+        cmd_add(&c, L"-frames:v"); cmd_add(&c, L"1");
+        cmd_add(&c, L"-f"); cmd_add(&c, L"rawvideo");
+        cmd_add(&c, L"-pix_fmt"); cmd_add(&c, L"bgr24");
+        cmd_add(&c, L"pipe:1");
+        Child ch;
+        if (spawn(c.s, &ch, 1) != 0) {
+            free(c.s);
+            LOG("[涂黑测试] 无法启动 ffmpeg\n");
+            failed = 1;
+            break;
+        }
+        free(c.s);
+        size_t need = (size_t)ws[ti] * hs[ti] * 3;
+        uint8_t *frame = malloc(need);
+        if (!frame) { child_wait(&ch); LOG("[涂黑测试] 内存不足\n"); failed = 1; break; }
+        int ok = read_exact(ch.r, frame, need);
+        child_wait(&ch);
+        if (!ok) { free(frame); LOG("[涂黑测试] 第一帧解码失败\n"); failed = 1; break; }
+        for (int k = 0; k < TEST_NPCT; k++) {
+            int pct = 85 + k;
+            uint8_t *work = malloc(need);
+            if (!work) { LOG("[涂黑测试] 内存不足\n"); failed = 1; break; }
+            memcpy(work, frame, need);   /* 每档都从干净帧出发：大半径需要小半径已黑的像素 */
+            mask_circle_bgr(work, ws[ti], hs[ti], pct);
+            int col = k % TEST_COLS, row = k / TEST_COLS;
+            uint8_t *dst = ts.sheet +
+                ((size_t)(ti * ts.sec_h + TEST_HEADER + row * (ts.tile_h + TEST_GAP)) * ts.w
+                 + (size_t)col * TEST_TW) * 3;
+            downscale_bgr(work, ws[ti], hs[ti], dst, TEST_TW, ts.tile_h, ts.w * 3);
+            free(work);
+        }
+        free(frame);
+    }
+    free(ffmpeg);
+    free(path);
+    if (failed) {
+        free(ts.sheet);
+        g_test_failed = 1;
+    } else {
+        test_free_sheet();
+        g_test = ts;
+        g_test_failed = 0;
+    }
+    PostMessage(g_hwnd, APP_TESTDONE, 0, 0);
+    return 0;
+}
+
+static void test_clamp_scroll(HWND wnd) {
+    RECT rc;
+    GetClientRect(wnd, &rc);
+    double scale = (double)(rc.right > 0 ? rc.right : 1) / g_test.w;
+    if (scale > 1.0) scale = 1.0;
+    g_test_scale = scale;
+    int disp_h = (int)(g_test.h * scale + 0.5);
+    int maxpos = disp_h - rc.bottom;
+    if (maxpos < 0) maxpos = 0;
+    if (g_test_scroll > maxpos) g_test_scroll = maxpos;
+    if (g_test_scroll < 0) g_test_scroll = 0;
+}
+
+static LRESULT CALLBACK test_wndproc(HWND wnd, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(wnd, &ps);
+        RECT rc;
+        GetClientRect(wnd, &rc);
+        FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        SetBkMode(dc, TRANSPARENT);
+        if (g_test.sheet && g_test.w > 0) {
+            test_clamp_scroll(wnd);
+            double scale = g_test_scale;
+            int disp_w = (int)(g_test.w * scale + 0.5);
+            int disp_h = (int)(g_test.h * scale + 0.5);
+            SCROLLINFO si;
+            ZeroMemory(&si, sizeof(si));
+            si.cbSize = sizeof(si);
+            si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            si.nMin = 0; si.nMax = disp_h;
+            si.nPage = (UINT)(rc.bottom + 1);
+            if (si.nPage > (UINT)disp_h + 1) si.nPage = (UINT)disp_h + 1;
+            si.nPos = g_test_scroll;
+            SetScrollInfo(wnd, SB_VERT, &si, TRUE);
+            BITMAPINFO bi;
+            ZeroMemory(&bi, sizeof(bi));
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = g_test.w;
+            bi.bmiHeader.biHeight = -g_test.h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 24;
+            SetStretchBltMode(dc, COLORONCOLOR);
+            StretchDIBits(dc, 0, -g_test_scroll, disp_w, disp_h,
+                          0, 0, g_test.w, g_test.h, g_test.sheet, &bi,
+                          DIB_RGB_COLORS, SRCCOPY);
+            int fh = (int)(TEST_HEADER * scale * 0.55);
+            if (fh < 13) fh = 13;
+            if (fh > 44) fh = 44;
+            HFONT f = CreateFontW(-fh, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                                  L"Microsoft YaHei UI");
+            HGDIOBJ of = SelectObject(dc, f);
+            SetTextColor(dc, RGB(0, 255, 80));
+            wchar_t buf[16];
+            for (int t = 0; t < g_test.tracks; t++) {
+                _snwprintf(buf, 16, L"cam%d", t);
+                TextOutW(dc, 10, (int)(t * g_test.sec_h * scale) - g_test_scroll + 4,
+                         buf, lstrlenW(buf));
+                for (int k = 0; k < TEST_NPCT; k++) {
+                    int col = k % TEST_COLS, row = k / TEST_COLS;
+                    int x = (int)(col * TEST_TW * scale) + 6;
+                    int y = (int)((t * g_test.sec_h + TEST_HEADER + row * (g_test.tile_h + TEST_GAP)) * scale)
+                            - g_test_scroll + 4;
+                    _snwprintf(buf, 16, L"%d%%", 85 + k);
+                    TextOutW(dc, x, y, buf, lstrlenW(buf));
+                }
+            }
+            SelectObject(dc, of);
+            DeleteObject(f);
+        } else {
+            SetTextColor(dc, RGB(190, 190, 190));
+            RECT rc2 = { 0, 0, rc.right, rc.bottom };
+            DrawTextW(dc, g_test_failed ? L"生成失败（见主窗口日志）"
+                                        : L"正在生成对比图…",
+                      -1, &rc2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        EndPaint(wnd, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        InvalidateRect(wnd, NULL, FALSE);
+        return 0;
+    case WM_VSCROLL: {
+        RECT rc;
+        GetClientRect(wnd, &rc);
+        int line = rc.bottom / 12; if (line < 60) line = 60;
+        switch (LOWORD(wp)) {
+        case SB_LINEDOWN: g_test_scroll += line; break;
+        case SB_LINEUP:   g_test_scroll -= line; break;
+        case SB_PAGEDOWN: g_test_scroll += rc.bottom - line; break;
+        case SB_PAGEUP:   g_test_scroll -= rc.bottom - line; break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: g_test_scroll = HIWORD(wp); break;
+        case SB_BOTTOM: g_test_scroll = 0x7fffffff; break;
+        case SB_TOP:    g_test_scroll = 0; break;
+        default: return 0;
+        }
+        test_clamp_scroll(wnd);
+        InvalidateRect(wnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int delta = (short)HIWORD(wp);
+        RECT rc;
+        GetClientRect(wnd, &rc);
+        int line = rc.bottom / 12; if (line < 60) line = 60;
+        g_test_scroll -= delta / 120 * line;
+        test_clamp_scroll(wnd);
+        InvalidateRect(wnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        if (!g_test.sheet) return 0;
+        double scale = g_test_scale;
+        double ix = (double)(SHORT)LOWORD(lp) / scale;
+        double iy = (double)((SHORT)HIWORD(lp) + g_test_scroll) / scale;
+        for (int t = 0; t < g_test.tracks; t++) {
+            for (int k = 0; k < TEST_NPCT; k++) {
+                int col = k % TEST_COLS, row = k / TEST_COLS;
+                double x0 = (double)col * TEST_TW;
+                double y0 = t * g_test.sec_h + TEST_HEADER + row * (g_test.tile_h + TEST_GAP);
+                if (ix >= x0 && ix < x0 + TEST_TW && iy >= y0 && iy < y0 + g_test.tile_h) {
+                    wchar_t buf[16];
+                    char b[128];
+                    wsprintfW(buf, L"%d", 85 + k);
+                    SetDlgItemTextW(g_hwnd, IDC_E_MASK, buf);
+                    sprintf(b, "[涂黑测试] 已把「涂黑%%」设为 %d（点「开始提取」生效）\n", 85 + k);
+                    gui_log(NULL, b);
+                    return 0;
+                }
+            }
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        g_hwnd_test = NULL;
+        return 0;
+    }
+    return DefWindowProcW(wnd, m, wp, lp);
+}
+
+static void start_mask_test(void) {
+    if (g_npaths == 0) {
+        MessageBoxW(g_hwnd, L"先往列表里添加视频文件", L"涂黑测试", MB_ICONINFORMATION);
+        return;
+    }
+    if (g_test_thread) {
+        MessageBoxW(g_hwnd, L"涂黑测试正在进行中…", L"涂黑测试", MB_ICONINFORMATION);
+        return;
+    }
+    int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
+    int item = sel >= 0 ? sel : 0;
+    wchar_t *path = _wcsdup(g_paths[item]);
+    if (!g_hwnd_test) {
+        RECT wr = { 0, 0, 1560, 1060 };
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        g_hwnd_test = CreateWindowW(L"OsvSharpTest",
+                                    L"涂黑测试 — 点击任意一格，把「涂黑%」设为该值（85~99）",
+                                    WS_OVERLAPPEDWINDOW,
+                                    CW_USEDEFAULT, CW_USEDEFAULT,
+                                    wr.right - wr.left, wr.bottom - wr.top,
+                                    g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        ShowWindow(g_hwnd_test, SW_SHOW);
+    } else {
+        ShowWindow(g_hwnd_test, SW_SHOW);
+        SetForegroundWindow(g_hwnd_test);
+    }
+    test_free_sheet();
+    g_test_failed = 0;
+    g_test_scroll = 0;
+    InvalidateRect(g_hwnd_test, NULL, TRUE);
+    g_test_thread = CreateThread(NULL, 0, test_worker, path, 0, NULL);
+}
+
 static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1342,6 +1677,7 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_OUT);
         make_ctl(wnd, L"BUTTON", L"浏览…", 0, IDC_B_BROWSE);
         make_ctl(wnd, L"BUTTON", L"参数说明", 0, IDC_B_HELP);
+        make_ctl(wnd, L"BUTTON", L"涂黑测试", 0, IDC_B_TEST);
         make_ctl(wnd, L"BUTTON", L"添加文件", 0, IDC_B_ADD);
         make_ctl(wnd, L"BUTTON", L"移除选中", 0, IDC_B_REM);
         make_ctl(wnd, L"BUTTON", L"清空", 0, IDC_B_CLEAR);
@@ -1404,6 +1740,7 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_running) { ListView_DeleteAllItems(g_list); g_npaths = 0; }
             break;
         case IDC_B_BROWSE: browse_outdir(wnd); break;
+        case IDC_B_TEST: start_mask_test(); break;
         case IDC_B_HELP:
             MessageBoxW(wnd,
                 L"三个核心参数的关系：视频按\u201c抽帧间隔\u201d分组，每组末尾\u201c锐度窗口\u201d\n"
@@ -1487,6 +1824,10 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         free(m);
         return 0;
     }
+    case APP_TESTDONE:
+        if (g_test_thread) { CloseHandle(g_test_thread); g_test_thread = NULL; }
+        if (g_hwnd_test) InvalidateRect(g_hwnd_test, NULL, TRUE);
+        return 0;
     case APP_ALLDONE:
         g_running = 0;
         EnableWindow(GetDlgItem(wnd, IDC_B_START), TRUE);
@@ -1528,6 +1869,9 @@ static int gui_run(void) {
     RegisterClassW(&wc);
     wc.lpfnWndProc = pv_wndproc;
     wc.lpszClassName = L"OsvSharpPreview";
+    RegisterClassW(&wc);
+    wc.lpfnWndProc = test_wndproc;
+    wc.lpszClassName = L"OsvSharpTest";
     RegisterClassW(&wc);
     g_ffmpeg = find_ffmpeg(NULL);
     g_hwnd = CreateWindowW(L"OsvSharpWnd",
@@ -1831,6 +2175,29 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
 int wmain(int argc, wchar_t **argv) {
     if (argc <= 1) return gui_run();  /* double-click: GUI; with args: CLI */
     SetConsoleOutputCP(CP_UTF8);
+
+    /* --masktest <video> [out.png]：无界面自检，走与 GUI「涂黑测试」完全
+     * 相同的代码路径（第一帧 × 85~99% 对比大图），把结果写成 PNG。 */
+    if (argc >= 2 && !wcscmp(argv[1], L"--masktest")) {
+        if (argc < 3) { printf("usage: --masktest <video> [out.png]\n"); return 2; }
+        HANDLE th = CreateThread(NULL, 0, test_worker, _wcsdup(argv[2]), 0, NULL);
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+        if (!g_test.sheet) { printf("mask test failed\n"); return 1; }
+        size_t n = (size_t)g_test.w * g_test.h;
+        unsigned char *rgb = malloc(n * 3);
+        for (size_t i = 0; i < n; i++) {
+            rgb[i * 3 + 0] = g_test.sheet[i * 3 + 2];
+            rgb[i * 3 + 1] = g_test.sheet[i * 3 + 1];
+            rgb[i * 3 + 2] = g_test.sheet[i * 3 + 0];
+        }
+        char *o8 = w_to_utf8(argc > 3 ? argv[3] : L"mask_test_sheet.png");
+        int ok = o8 && stbi_write_png(o8, g_test.w, g_test.h, 3, rgb, g_test.w * 3);
+        printf("%s: %dx%d sheet\n", ok ? "written" : "write failed", g_test.w, g_test.h);
+        free(rgb);
+        free(o8);
+        return ok ? 0 : 1;
+    }
 
     const wchar_t **inputs = malloc(sizeof(wchar_t *) * (size_t)argc);
     int ninputs = 0;
