@@ -16,6 +16,12 @@
  *           → split the JPEG stream, write one file per winner named by its
  *             source frame index.
  *
+ *           With -mask N (default 80), pass B adds a full-resolution
+ *           circular mask PNG + maskedmerge to the filter graph, so
+ *           everything outside the lens circle is blacked out during the
+ *           one and only mjpeg encode: no extra decode/encode pass, no
+ *           generation loss.
+ *
  * The metric and the window arithmetic are ports of spirula-studio's
  * src/video/shaders/video.slang and src/app/FrameExtract.cpp, so results are
  * comparable with that tool's `spirula sam extract`.
@@ -46,11 +52,10 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-/* JPEG 解码/重编码（边缘涂黑用）：内嵌公有领域单头库，编译进 exe，
- * 运行时仍是无依赖单文件。STBI_WINDOWS_UTF8 使中文路径走 _wfopen。 */
-#define STBI_WINDOWS_UTF8
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+/* 圆形遮罩 PNG 生成（边缘涂黑用）：内嵌公有领域单头写库，编译进 exe，
+ * 运行时仍是无依赖单文件。涂黑本体已并入抽帧编码滤镜（见 make_mask_png
+ * 与 pass_b），不再引用图像解码库。 */
+#define STBIW_WINDOWS_UTF8
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -62,7 +67,7 @@
 #define DEF_SKIP    8      /* 25 fps source → ~3 written frames per second */
 #define DEF_JPEG_Q  2      /* ffmpeg mjpeg -q:v (lower = better)            */
 #define DEF_THUMB   512    /* spirula's thumbnail size                      */
-#define DEF_MASK    88     /* 涂黑保留半径百分数（0=关），拆解完成后执行      */
+#define DEF_MASK    80     /* 涂黑保留半径百分数（0=关），抽帧编码时同步执行  */
 
 /* --------------------------------------------------------- 参数详解（速查）
  *
@@ -78,7 +83,7 @@
  * │ 最低清晰度  │ min  │ 0（不过滤） │ 分数低于此值的胜者不出图        │
  * │ JPEG质量    │ q    │ 2          │ mjpeg -q:v，越小越清晰          │
  * │ 评分缩略图  │thumb │ 512        │ 打分用的灰度图边长，影响分数刻度│
- * │ 涂黑半径%   │ mask │ 88（0=关） │ 拆解完成后圆外涂黑，切黑边+模糊环│
+ * │ 涂黑半径%   │ mask │ 80（0=关） │ 抽帧时圆外涂黑，切黑边+模糊环   │
  * └────────────┴──────┴────────────┴────────────────────────────────┘
  *
  * 【抽帧间隔 skip（-s，默认 8）】
@@ -406,6 +411,7 @@ typedef struct {
     const wchar_t *input;    /* the .OSV path                    */
     const wchar_t *hw;       /* L"" = software                   */
     int thumb, jpeg_q;
+    int vw, vh;              /* current track resolution (mask)  */
 } Ctx;
 
 /* returns malloc'd probed hwaccel name, L"" for software, or NULL when even
@@ -522,9 +528,11 @@ static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_
 
 /* pass B: re-decode, encode every frame as mjpeg over the pipe, and write
  * only the winners (counted by frame number -- no select expression, whose
- * length ffmpeg's expression parser cannot take for a few hundred frames). */
+ * length ffmpeg's expression parser cannot take for a few hundred frames).
+ * maskp != NULL 时挂全分辨率圆形遮罩 + maskedmerge：在那唯一一次编码前
+ * 把圆外清黑（无额外解码/编码遍，无二次有损编码损失）。 */
 static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
-                  const wchar_t *outdir) {
+                  const wchar_t *outdir, const wchar_t *maskp) {
     Cmd c = {0};
     cmd_add(&c, cx->ffmpeg);
     cmd_add(&c, L"-v");
@@ -533,8 +541,32 @@ static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
     if (wcslen(cx->hw)) cmd_add2(&c, L"-hwaccel", cx->hw);
     cmd_add(&c, L"-i");
     cmd_add(&c, cx->input);
-    wchar_t mapspec[16]; swprintf(mapspec, 16, L"0:v:%d", track);
-    cmd_add2(&c, L"-map", mapspec);
+    if (maskp) {
+        /* 副输入 1fps + framesync 重复末帧：每秒时间轴只解一次遮罩 */
+        cmd_add(&c, L"-loop");
+        cmd_add(&c, L"1");
+        cmd_add(&c, L"-framerate");
+        cmd_add(&c, L"1");
+        cmd_add(&c, L"-i");
+        cmd_add(&c, maskp);
+        cmd_add(&c, L"-f");
+        cmd_add(&c, L"lavfi");
+        cmd_add(&c, L"-i");
+        wchar_t blackspec[80];
+        _snwprintf(blackspec, 80, L"color=c=black:s=%dx%d:r=1", cx->vw, cx->vh);
+        cmd_add(&c, blackspec);
+    }
+    if (maskp) {
+        wchar_t fc[256];
+        _snwprintf(fc, 256,
+                   L"[0:v:%d]format=gbrp[v];[1:v]format=gbrp[mk];"
+                   L"[2:v]format=gbrp[bk];[v][bk][mk]maskedmerge[out]", track);
+        cmd_add2(&c, L"-filter_complex", fc);
+        cmd_add2(&c, L"-map", L"[out]");
+    } else {
+        wchar_t mapspec[16]; swprintf(mapspec, 16, L"0:v:%d", track);
+        cmd_add2(&c, L"-map", mapspec);
+    }
     cmd_add(&c, L"-fps_mode");
     cmd_add(&c, L"passthrough");
     cmd_add(&c, L"-c:v");
@@ -621,43 +653,16 @@ all_written:
     return 0;
 }
 
-/* ------------------------------------------- 边缘涂黑（拆解完成后自动执行） */
+/* ------------------------------------------- 边缘涂黑（并入抽帧编码管线） */
 
 /* 鱼眼帧中心圆外涂黑：黑边 + 紧贴黑边的失焦模糊环一并切掉。
  * 圆心=画面中心，保留半径 = pct% × 短边 ÷ 2；同一镜头所有帧同一比例，
  * 宁多勿少（模糊环内侧还有一圈渐进的过渡软带）。涂黑区无纹理，SfM
- * 特征点天然落不进去，等价于给整条建模链喂了 mask。 */
-static void mask_circle(uint8_t *img, int w, int h, int pct) {
-    double cx = w * 0.5, cy = h * 0.5;
-    double r = pct * 0.01 * (double)(w < h ? w : h) * 0.5;
-    double out2 = r * r, in2 = (r - 1.5) * (r - 1.5);
-    int x0 = (int)(cx - r) - 2; if (x0 < 0) x0 = 0;
-    int x1 = (int)(cx + r) + 3; if (x1 > w) x1 = w;
-    int y0 = (int)(cy - r) - 2; if (y0 < 0) y0 = 0;
-    int y1 = (int)(cy + r) + 3; if (y1 > h) y1 = h;
-    size_t rowbytes = (size_t)w * 4;
-    for (int y = 0; y < h; y++) {
-        uint8_t *row = img + (size_t)y * rowbytes;
-        if (y < y0 || y >= y1) { memset(row, 0, rowbytes); continue; }
-        if (x0 > 0) memset(row, 0, (size_t)x0 * 4);
-        if (x1 < w) memset(row + (size_t)x1 * 4, 0, rowbytes - (size_t)x1 * 4);
-        double dy = y + 0.5 - cy, dy2 = dy * dy;
-        for (int x = x0; x < x1; x++) {
-            uint8_t *px = row + (size_t)x * 4;
-            double dx = x + 0.5 - cx;
-            double d2 = dx * dx + dy2;
-            if (d2 >= out2) {
-                px[0] = px[1] = px[2] = 0;
-            } else if (d2 > in2) {
-                double a = (r - sqrt(d2)) / 1.5;
-                if (a < 0) a = 0; else if (a > 1) a = 1;
-                px[0] = (uint8_t)(px[0] * a);
-                px[1] = (uint8_t)(px[1] * a);
-                px[2] = (uint8_t)(px[2] * a);
-            }
-        }
-    }
-}
+ * 特征点天然落不进去，等价于给整条建模链喂了 mask。
+ *
+ * 实现：pass_b 的 ffmpeg 滤镜链里挂全分辨率圆形遮罩 + maskedmerge，
+ * 在那唯一一次 mjpeg 编码前把圆外清黑——没有额外的解码/重编码遍，
+ * 没有二次有损编码损失，涂黑成本≈内存带宽。 */
 
 typedef struct { uint8_t *buf; size_t n, cap; } MemBuf;
 
@@ -671,125 +676,51 @@ static void mem_write(void *ctx, void *data, int n) {
     m->n += (size_t)n;
 }
 
-/* 解码 → 涂黑 → 整帧一次性回写（q95 重编码，提取产物 q:v≈2，损失可忽略）。
- * 返回 0 成功。 */
-static int mask_one_file(const wchar_t *path, int pct) {
-    char *p8 = w_to_utf8(path);
-    if (!p8) return -1;
-    int w, h;
-    uint8_t *img = stbi_load(p8, &w, &h, NULL, 4);
-    free(p8);
-    if (!img) return -1;
-    mask_circle(img, w, h, pct);
-    size_t npx = (size_t)w * h;
-    uint8_t *rgb = malloc(npx * 3);
-    if (!rgb) { free(img); return -1; }
-    for (size_t i = 0; i < npx; i++) {
-        rgb[i * 3 + 0] = img[i * 4 + 0];
-        rgb[i * 3 + 1] = img[i * 4 + 1];
-        rgb[i * 3 + 2] = img[i * 4 + 2];
-    }
-    free(img);
-    MemBuf m = {0};
-    int ok = stbi_write_jpg_to_func(mem_write, &m, w, h, 3, rgb, 95);
-    free(rgb);
-    if (!ok) { free(m.buf); return -1; }
-    FILE *f = _wfopen(path, L"wb");
-    if (!f) { free(m.buf); return -1; }
-    size_t wr = m.n ? fwrite(m.buf, 1, m.n, f) : 0;
-    fclose(f);
-    free(m.buf);
-    return wr == m.n ? 0 : -1;
-}
-
-typedef struct { wchar_t **v; size_t n, cap; } WList;
-
-static void wl_push(WList *l, const wchar_t *s) {
-    if (l->n == l->cap) {
-        l->cap = l->cap ? l->cap * 2 : 256;
-        l->v = realloc(l->v, l->cap * sizeof(wchar_t *));
-    }
-    l->v[l->n++] = _wcsdup(s);
-}
-
-static void wl_collect(WList *l, const wchar_t *dir) {
-    wchar_t pat[MAX_PATH * 2], full[MAX_PATH * 2];
-    WIN32_FIND_DATAW fd;
-    _snwprintf(pat, MAX_PATH * 2 - 1, L"%ls\\*", dir);
-    pat[MAX_PATH * 2 - 1] = 0;
-    HANDLE h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-        _snwprintf(full, MAX_PATH * 2 - 1, L"%ls\\%ls", dir, fd.cFileName);
-        full[MAX_PATH * 2 - 1] = 0;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            wl_collect(l, full);
-        } else {
-            const wchar_t *dot = wcsrchr(fd.cFileName, L'.');
-            if (dot && (!wcsicmp(dot, L".jpg") || !wcsicmp(dot, L".jpeg")))
-                wl_push(l, full);
+/* 生成 %TEMP% 下的圆形遮罩 PNG（灰度：圆内 0 / 圆外 255 / 1.5px 抗锯齿
+ * 过渡）。maskedmerge 语义是 mask=255 选第二个输入（黑底），所以圆外
+ * 才是 255。按 track 命名防双目两路互相覆盖。返回 _wcsdup 的路径（用完
+ * 由调用方 _wunlink + free），失败返回 NULL。 */
+static wchar_t *make_mask_png(int w, int h, int pct, int track) {
+    wchar_t temp[MAX_PATH * 2];
+    wchar_t *path;
+    char *p8;
+    uint8_t *m;
+    FILE *f;
+    MemBuf mb = {0};
+    double cx = w * 0.5, cy = h * 0.5;
+    double r = pct * 0.01 * (double)(w < h ? w : h) * 0.5;
+    DWORD n = GetTempPathW(MAX_PATH * 2, temp);
+    int x, y, ok;
+    if (n == 0 || n >= MAX_PATH * 2) return NULL;
+    path = malloc((n + 48) * sizeof(wchar_t));
+    if (!path) return NULL;
+    _snwprintf(path, n + 47, L"%sosvsharp_mask_%lu_%d.png",
+               temp, (unsigned long)GetCurrentProcessId(), track);
+    m = malloc((size_t)w * h);
+    if (!m) { free(path); return NULL; }
+    for (y = 0; y < h; y++) {
+        uint8_t *row = m + (size_t)y * w;
+        double dy = y + 0.5 - cy, dy2 = dy * dy;
+        for (x = 0; x < w; x++) {
+            double dx = x + 0.5 - cx;
+            double d = sqrt(dx * dx + dy2);
+            if (d <= r - 1.5) row[x] = 0;
+            else if (d >= r)  row[x] = 255;
+            else row[x] = (uint8_t)((d - (r - 1.5)) / 1.5 * 255.0 + 0.5);
         }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-}
-
-typedef struct { WList *l; int pct; } MaskJob;
-
-static MaskJob *g_mjob;
-static volatile LONG g_mnext, g_mdone, g_mfail;
-static volatile int g_mcancel;
-
-static DWORD WINAPI mask_worker(LPVOID unused) {
-    (void)unused;
-    for (;;) {
-        if (g_mcancel) break;
-        LONG i = InterlockedIncrement(&g_mnext);
-        if (i > (LONG)g_mjob->l->n) break;
-        if (mask_one_file(g_mjob->l->v[i - 1], g_mjob->pct) != 0)
-            InterlockedIncrement(&g_mfail);
-        InterlockedIncrement(&g_mdone);
     }
-    return 0;
-}
-
-/* 涂黑 outdir 下（递归）全部 jpg；返回处理张数，取消返回 -1。
- * 多线程执行；LOG/STATUS 只由本线程（抽帧 worker）发，避免输出交错。 */
-static long long mask_all(const wchar_t *outdir, int pct) {
-    WList l = {0};
-    wl_collect(&l, outdir);
-    if (l.n == 0) return 0;
-
-    MaskJob job = { &l, pct };
-    g_mjob = &job;
-    g_mnext = g_mdone = g_mfail = 0;
-    g_mcancel = 0;
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    int nt = (int)si.dwNumberOfProcessors;
-    if (nt < 1) nt = 1;
-    if (nt > 8) nt = 8;
-    HANDLE th[8];
-    int started = 0;
-    for (int i = 0; i < nt; i++) {
-        th[i] = CreateThread(NULL, 0, mask_worker, NULL, 0, NULL);
-        if (th[i]) started++;
-    }
-    for (;;) {
-        if (g_hk && g_hk->cancel && *g_hk->cancel) g_mcancel = 1;
-        STATUS(g_file_idx, 4, 0, (long long)g_mdone);
-        if (g_mcancel || g_mdone >= (LONG)l.n) break;
-        Sleep(150);
-    }
-    for (int i = 0; i < started; i++) {
-        WaitForSingleObject(th[i], INFINITE);
-        CloseHandle(th[i]);
-    }
-    for (size_t i = 0; i < l.n; i++) free(l.v[i]);
-    free(l.v);
-    g_mjob = NULL;
-    return g_mcancel ? -1 : (long long)g_mdone;
+    p8 = w_to_utf8(path);
+    ok = p8 && stbi_write_png_to_func(mem_write, &mb, w, h, 1, m, w);
+    free(p8);
+    free(m);
+    if (!ok) { free(mb.buf); free(path); return NULL; }
+    f = _wfopen(path, L"wb");
+    if (!f) { free(mb.buf); free(path); return NULL; }
+    ok = mb.n > 0 && fwrite(mb.buf, 1, mb.n, f) == mb.n;
+    fclose(f);
+    free(mb.buf);
+    if (!ok) { _wunlink(path); free(path); return NULL; }
+    return path;
 }
 
 /* ------------------------------------------------------------------- GUI */
@@ -1401,13 +1332,13 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         add_hint(wnd, L"胜者分数低于此值丢弃\n0=不过滤；阈值参考\n旁 sharpness_cam0.csv",
                  230, 124, IDC_HINT_MIN);
         add_hint(wnd, L"越小越清晰\n2≈高质量", 356, 90, IDC_HINT_Q);
-        add_hint(wnd, L"拆解后圆外涂黑(黑边+模糊环)\n越小切越多\n0=不涂黑", 448, 86, IDC_HINT_MASK);
+        add_hint(wnd, L"抽帧时圆外涂黑(黑边+模糊环)\n越小切越多\n0=不涂黑", 448, 86, IDC_HINT_MASK);
         add_hint(wnd, L"留空=输出到各视频旁\n<视频名>_sharp\\", 540, 260, IDC_HINT_OUT);
         make_ctl(wnd, L"EDIT", L"8", WS_BORDER | ES_AUTOHSCROLL, IDC_E_SKIP);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_KEEP);
         make_ctl(wnd, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MIN);
         make_ctl(wnd, L"EDIT", L"2", WS_BORDER | ES_AUTOHSCROLL, IDC_E_Q);
-        make_ctl(wnd, L"EDIT", L"88", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
+        make_ctl(wnd, L"EDIT", L"80", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_OUT);
         make_ctl(wnd, L"BUTTON", L"浏览…", 0, IDC_B_BROWSE);
         make_ctl(wnd, L"BUTTON", L"参数说明", 0, IDC_B_HELP);
@@ -1492,16 +1423,16 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"与清晰段之间，通常先试 min~avg 之间的值，再按丢弃比例微调。\n"
                 L"注意：数值与评分缩略图尺寸(-b)和场景内容相关，改参数要重标。\n\n"
                 L"【JPEG质量】（默认 2）ffmpeg -q:v，越小越清晰，2 接近视觉无损。\n\n"
-                L"【涂黑%】（默认 88，0 = 不涂黑）\n"
-                L"拆帧完成后把每张图中心圆外的像素涂黑：圆心=画面中心，\n"
-                L"保留半径 = 百分数×短边÷2。用于切掉鱼眼黑边和紧贴黑边的\n"
-                L"失焦模糊环；涂黑区不产生图像梯度，SfM 特征点天然落不进\n"
-                L"去，等价于给建模链喂 mask。\n"
-                L"数字越小切得越多：84 比 88 每个方向多切 4% 半径，保留\n"
-                L"面积 ≈ 百分数的平方（88%→77%，84%→71%）。\n"
-                L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 88 已留\n"
-                L"余量；若出图仍见模糊边，往 84~86 方向试。涂黑走多线程，\n"
-                L"大批量会多花一点时间。\n\n"
+                L"【涂黑%】（默认 80，0 = 不涂黑）\n"
+                L"抽帧编码时同步把每张图中心圆外的像素涂黑：圆心=画面\n"
+                L"中心，保留半径 = 百分数×短边÷2。用于切掉鱼眼黑边和紧\n"
+                L"贴黑边的失焦模糊环；涂黑区不产生图像梯度，SfM 特征点\n"
+                L"天然落不进去，等价于给建模链喂 mask。\n"
+                L"数字越小切得越多，保留面积 ≈ 百分数的平方\n"
+                L"（80%→64%，88%→77%）。\n"
+                L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 80 已留\n"
+                L"足余量；想少切一点可往 84~88 方向调。涂黑并入编码滤镜，\n"
+                L"几乎不增加耗时，且无二次有损编码。\n\n"
                 L"【输出目录】留空 = 在各视频旁建 <视频名>_sharp\\。\n"
                 L"双目文件（OSV）分 cam0、cam1 子目录；单路视频直接放入。",
                 L"参数说明", MB_OK | MB_ICONINFORMATION);
@@ -1530,8 +1461,6 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             _snwprintf(text, 128, L"cam%d 评分中 %lld 帧", m->track, m->a);
         else if (m->phase == 2)
             _snwprintf(text, 128, L"cam%d 输出中 %lld 张", m->track, m->a);
-        else if (m->phase == 4)
-            _snwprintf(text, 128, L"涂黑中 %lld 张", m->a);
         else {
             _snwprintf(text, 128, L"cam%d 已选 %lld 张", m->track, m->a);
             if (m->idx != g_cnt_idx) { g_cnt_idx = m->idx; g_cnt_total = 0; }
@@ -1634,9 +1563,9 @@ static void usage(void) {
         "  -t, --track <n>      video track 0/1 (default: both)\n"
         "  -q, --jpeg-q <n>     JPEG质量，ffmpeg -q:v，越小越清晰（默认 2）\n"
         "  -b, --thumb <n>      评分缩略图边长，只影响打分与分数刻度（默认 512）\n"
-        "      -mask <n>        边缘涂黑：拆解完成后把每张图中心圆外涂黑，\n"
+        "      -mask <n>        边缘涂黑：抽帧编码时把每张图中心圆外涂黑，\n"
         "                       保留半径=n%%×短边÷2，越小切得越多\n"
-        "                       （默认 88；0 = 不涂黑）\n"
+        "                       （默认 80；0 = 不涂黑）\n"
         "  -o, --out <dir>      output directory (default: <video>_sharp)\n"
         "      --ffmpeg <path>  ffmpeg executable\n"
         "      --hwaccel <name> force cuda/vulkan/d3d11va/none\n"
@@ -1686,13 +1615,16 @@ static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem) {
 }
 
 /* Enumerate real video streams via `ffmpeg -i` stderr (header parse only, no
- * decode).  Non-attached-pic video stream indices go into idx[]; *nattach
- * counts attached-pic cover-art video streams (DJI Avata360 MP4 carries one
- * as 0:v:1 -- running the OSV two-track logic on it yields an empty cam1).
+ * decode).  Non-attached-pic video stream indices go into idx[], with each
+ * stream's resolution in the parallel ws[]/hs[] (0 = unknown -- edge masking
+ * is skipped for such tracks); *nattach counts attached-pic cover-art video
+ * streams (DJI Avata360 MP4 carries one as 0:v:1 -- running the OSV
+ * two-track logic on it yields an empty cam1).
  * Returns the count written to idx[], or -1 when nothing parseable came out
  * (caller then falls back to the old assume-two-tracks behaviour). */
 static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
-                               int *idx, int maxn, int *nattach) {
+                               int *idx, int *ws, int *hs, int maxn,
+                               int *nattach) {
     *nattach = 0;
     Cmd c = {0};
     cmd_add(&c, ffmpeg);
@@ -1726,10 +1658,24 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
             char *colon = strchr(sp + 8, ':');   /* "Stream #0:N[...]: ..." */
             if (colon && sscanf(colon + 1, "%d", &si) == 1 && si >= 0) {
                 parsed = 1;
-                if (strstr(sp, "attached pic"))
+                if (strstr(sp, "attached pic")) {
                     nat++;
-                else if (n < maxn)
-                    idx[n++] = si;
+                } else if (n < maxn) {
+                    /* 顺手抓 ", WxH" 分辨率（涂黑遮罩要用），同
+                     * pv_probe_info 的解析方式 */
+                    const char *q = sp;
+                    idx[n] = si;
+                    ws[n] = hs[n] = 0;
+                    while (*q && *q != '\n') {
+                        int wv, hv;
+                        if (sscanf(q, ", %dx%d", &wv, &hv) == 2 && wv > 0) {
+                            ws[n] = wv; hs[n] = hv;
+                            break;
+                        }
+                        q++;
+                    }
+                    n++;
+                }
             }
         }
         line = nl ? nl + 1 : NULL;
@@ -1745,7 +1691,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          double min_score, int track, int thumb, int jpeg_q,
                          int mask_pct, const wchar_t *hw_force, int file_idx) {
     g_file_idx = file_idx;
-    Ctx cx = { ffmpeg, input, L"", thumb, jpeg_q };
+    Ctx cx = { ffmpeg, input, L"", thumb, jpeg_q, 0, 0 };
     {
         char *i8 = w_to_utf8(input), *o8 = w_to_utf8(outdir);
         LOG("=== %s ===\n  outdir: %s\n  skip=%d keep=%d min_score=%.1f q=%d mask=%d%%\n",
@@ -1758,20 +1704,27 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
      * Avata360 的 0:v:1），按 OSV 双目逻辑跑它只会得到空的 cam1。
      * 流列表解析失败时退回老行为（假定 0、1 两条轨）。 */
     int tracks[2] = { 0, 1 }, ntracks = 2;
+    int tw[2] = { 0, 0 }, th[2] = { 0, 0 };   /* 每轨分辨率（涂黑遮罩用） */
     {
-        int vsidx[4], nattach = 0;
-        int nreal = probe_video_streams(ffmpeg, input, vsidx, 4, &nattach);
+        int vsidx[4], vsw[4], vsh[4], nattach = 0;
+        int nreal = probe_video_streams(ffmpeg, input, vsidx, vsw, vsh, 4, &nattach);
         if (nreal > 0) {
             ntracks = nreal > 2 ? 2 : nreal;
             tracks[0] = vsidx[0];
             tracks[1] = ntracks > 1 ? vsidx[1] : -1;
+            tw[0] = vsw[0]; th[0] = vsh[0];
+            tw[1] = ntracks > 1 ? vsw[1] : 0;
+            th[1] = ntracks > 1 ? vsh[1] : 0;
             if (nattach > 0)
                 LOG("video streams: %d real, %d attached-pic cover ignored\n",
                     nreal, nattach);
         }
     }
     if (track >= 0) {
-        if (track < ntracks) { tracks[0] = tracks[track]; ntracks = 1; }
+        if (track < ntracks) {
+            tracks[0] = tracks[track]; tw[0] = tw[track]; th[0] = th[track];
+            ntracks = 1;
+        }
         else {
             LOG("[track %d] not present, single-camera file -- skipped\n", track);
             ntracks = 0;
@@ -1782,6 +1735,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
     int rc = 0;
     for (int ti = 0; ti < ntracks && rc == 0; ti++) {
         int tr = tracks[ti];
+        cx.vw = tw[ti]; cx.vh = th[ti];
         int multi = ntracks > 1;
         size_t dlen = wcslen(outdir) + 16;
         wchar_t *dir = malloc(dlen * sizeof(wchar_t));
@@ -1847,27 +1801,28 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
 
         mkdirs_w(dir);
         STATUS(file_idx, 3, ti, (long long)sel.nwin);
-        LOG("[track %d] pass B: writing %zu jpegs...\n", ti, sel.nwin);
-        int pb = pass_b(&cx, tr, sel.win, sel.nwin, dir);
+        wchar_t *maskp = NULL;
+        if (mask_pct > 0 && cx.vw > 0 && cx.vh > 0) {
+            maskp = make_mask_png(cx.vw, cx.vh, mask_pct, ti);
+            if (maskp)
+                LOG("[track %d] pass B: writing %zu jpegs (edge mask %d%%, in-filter single encode)...\n",
+                    ti, sel.nwin, mask_pct);
+            else
+                LOG("[track %d] pass B: writing %zu jpegs (edge mask: cannot write temp png, skipped)...\n",
+                    ti, sel.nwin);
+        } else if (mask_pct > 0) {
+            LOG("[track %d] pass B: writing %zu jpegs (edge mask skipped: resolution unknown)...\n",
+                ti, sel.nwin);
+        } else {
+            LOG("[track %d] pass B: writing %zu jpegs...\n", ti, sel.nwin);
+        }
+        int pb = pass_b(&cx, tr, sel.win, sel.nwin, dir, maskp);
+        if (maskp) { _wunlink(maskp); free(maskp); }
         if (pb == -2) { rc = 2; free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
 
         free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir);
         if (hw) free(hw);
-    }
-    /* 拆解完成，立即按 mask_pct% 把输出帧的圆外涂黑（多线程，可取消） */
-    if (rc == 0 && mask_pct > 0) {
-        LOG("edge mask: blackening all jpegs at %d%%...\n", mask_pct);
-        long long nm = mask_all(outdir, mask_pct);
-        if (nm < 0) {
-            LOG("edge mask: cancelled\n");
-            rc = 2;
-        } else if (g_mfail) {
-            LOG("edge mask: %lld jpg done, %d failed\n", nm, (int)g_mfail);
-            if (rc == 0) rc = 1;
-        } else {
-            LOG("edge mask: %lld jpg blackened\n", nm);
-        }
     }
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
     return rc;
