@@ -67,7 +67,7 @@
 #define DEF_SKIP    8      /* 25 fps source → ~3 written frames per second */
 #define DEF_JPEG_Q  2      /* ffmpeg mjpeg -q:v (lower = better)            */
 #define DEF_THUMB   512    /* spirula's thumbnail size                      */
-#define DEF_MASK    80     /* 涂黑保留半径百分数（0=关），抽帧编码时同步执行  */
+#define DEF_MASK    95     /* 涂黑保留半径百分数（0=关），抽帧编码时同步执行  */
 
 /* --------------------------------------------------------- 参数详解（速查）
  *
@@ -83,7 +83,7 @@
  * │ 最低清晰度  │ min  │ 0（不过滤） │ 分数低于此值的胜者不出图        │
  * │ JPEG质量    │ q    │ 2          │ mjpeg -q:v，越小越清晰          │
  * │ 评分缩略图  │thumb │ 512        │ 打分用的灰度图边长，影响分数刻度│
- * │ 涂黑半径%   │ mask │ 80（0=关） │ 抽帧时圆外涂黑，切黑边+模糊环   │
+ * │ 涂黑半径%   │ mask │ 95（0=关） │ 抽帧时圆外涂黑，切黑边+模糊环   │
  * └────────────┴──────┴────────────┴────────────────────────────────┘
  *
  * 【抽帧间隔 skip（-s，默认 8）】
@@ -1673,7 +1673,7 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_KEEP);
         make_ctl(wnd, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MIN);
         make_ctl(wnd, L"EDIT", L"2", WS_BORDER | ES_AUTOHSCROLL, IDC_E_Q);
-        make_ctl(wnd, L"EDIT", L"80", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
+        make_ctl(wnd, L"EDIT", L"95", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_OUT);
         make_ctl(wnd, L"BUTTON", L"浏览…", 0, IDC_B_BROWSE);
         make_ctl(wnd, L"BUTTON", L"参数说明", 0, IDC_B_HELP);
@@ -1760,16 +1760,16 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"与清晰段之间，通常先试 min~avg 之间的值，再按丢弃比例微调。\n"
                 L"注意：数值与评分缩略图尺寸(-b)和场景内容相关，改参数要重标。\n\n"
                 L"【JPEG质量】（默认 2）ffmpeg -q:v，越小越清晰，2 接近视觉无损。\n\n"
-                L"【涂黑%】（默认 80，0 = 不涂黑）\n"
+                L"【涂黑%】（默认 95，0 = 不涂黑）\n"
                 L"抽帧编码时同步把每张图中心圆外的像素涂黑：圆心=画面\n"
                 L"中心，保留半径 = 百分数×短边÷2。用于切掉鱼眼黑边和紧\n"
                 L"贴黑边的失焦模糊环；涂黑区不产生图像梯度，SfM 特征点\n"
                 L"天然落不进去，等价于给建模链喂 mask。\n"
                 L"数字越小切得越多，保留面积 ≈ 百分数的平方\n"
-                L"（80%→64%，88%→77%）。\n"
-                L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 80 已留\n"
-                L"足余量；想少切一点可往 84~88 方向调。涂黑并入编码滤镜，\n"
-                L"几乎不增加耗时，且无二次有损编码。\n\n"
+                L"（95%→90%，88%→77%）。\n"
+                L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 95 是\n"
+                L"用户在对比图上选定的值；拿不准就点「涂黑测试」看对比\n"
+                L"图再定。涂黑并入编码滤镜，几乎不增加耗时，无二次损失。\n\n"
                 L"【输出目录】留空 = 在各视频旁建 <视频名>_sharp\\。\n"
                 L"双目文件（OSV）分 cam0、cam1 子目录；单路视频直接放入。",
                 L"参数说明", MB_OK | MB_ICONINFORMATION);
@@ -1909,7 +1909,7 @@ static void usage(void) {
         "  -b, --thumb <n>      评分缩略图边长，只影响打分与分数刻度（默认 512）\n"
         "      -mask <n>        边缘涂黑：抽帧编码时把每张图中心圆外涂黑，\n"
         "                       保留半径=n%%×短边÷2，越小切得越多\n"
-        "                       （默认 80；0 = 不涂黑）\n"
+        "                       （默认 95；0 = 不涂黑）\n"
         "  -o, --out <dir>      output directory (default: <video>_sharp)\n"
         "      --ffmpeg <path>  ffmpeg executable\n"
         "      --hwaccel <name> force cuda/vulkan/d3d11va/none\n"
