@@ -22,8 +22,8 @@
  *
  * Build:  clang -std=c99 -O2 osvsharp.c -o osvsharp.exe
  * Usage:  osvsharp <input.OSV> [outdir] [-s skip] [-k keep] [-m min_score]
- *                     [-t track] [-q jpeg_q] [-b thumb] [--ffmpeg PATH]
- *                     [--hwaccel NAME] [--no-hwaccel]
+ *                     [-t track] [-q jpeg_q] [-b thumb] [-mask pct]
+ *                     [--ffmpeg PATH] [--hwaccel NAME] [--no-hwaccel]
  */
 
 #ifndef UNICODE
@@ -46,6 +46,14 @@
 #include <stdarg.h>
 #include <wchar.h>
 
+/* JPEG 解码/重编码（边缘涂黑用）：内嵌公有领域单头库，编译进 exe，
+ * 运行时仍是无依赖单文件。STBI_WINDOWS_UTF8 使中文路径走 _wfopen。 */
+#define STBI_WINDOWS_UTF8
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -54,6 +62,58 @@
 #define DEF_SKIP    8      /* 25 fps source → ~3 written frames per second */
 #define DEF_JPEG_Q  2      /* ffmpeg mjpeg -q:v (lower = better)            */
 #define DEF_THUMB   512    /* spirula's thumbnail size                      */
+#define DEF_MASK    88     /* 涂黑保留半径百分数（0=关），拆解完成后执行      */
+
+/* --------------------------------------------------------- 参数详解（速查）
+ *
+ * 界面输入框（括号内为等价命令行参数）的含义与设置方法。
+ * 三个核心参数的关系：源视频按“抽帧间隔 skip”分组，每组末尾 keep 帧
+ * 评清晰度分，最清晰的一张出图；分数低于“最低清晰度”的整组放弃。
+ *
+ * ┌────────────┬──────┬────────────┬────────────────────────────────┐
+ * │ 界面标签    │ 参数  │ 默认        │ 作用                           │
+ * ├────────────┼──────┼────────────┼────────────────────────────────┤
+ * │ 抽帧间隔    │ skip │ 8          │ 每 skip 帧输出 1 张             │
+ * │ 锐度窗口    │ keep │ 留空=skip/2 │ 每组末尾 keep 帧里挑最清晰      │
+ * │ 最低清晰度  │ min  │ 0（不过滤） │ 分数低于此值的胜者不出图        │
+ * │ JPEG质量    │ q    │ 2          │ mjpeg -q:v，越小越清晰          │
+ * │ 评分缩略图  │thumb │ 512        │ 打分用的灰度图边长，影响分数刻度│
+ * │ 涂黑半径%   │ mask │ 88（0=关） │ 拆解完成后圆外涂黑，切黑边+模糊环│
+ * └────────────┴──────┴────────────┴────────────────────────────────┘
+ *
+ * 【抽帧间隔 skip（-s，默认 8）】
+ *   决定出图密度：输出节奏 ≈ 帧率 ÷ skip。25fps、skip=8 → 约 3 张/秒；
+ *   skip=4 约 6 张/秒。想要更密调小、更稀调大，对清晰度本身无影响。
+ *
+ * 【锐度窗口 keep（-k，界面留空 = 自动取 skip/2 四舍五入）】
+ *   每组 skip 帧里只有“末尾 keep 帧”参与评分，从中挑分数最高的一张
+ *   输出。例：skip=8、keep=4 → 每组的第 4~7 帧打分，最清晰者出图，
+ *   前 4 帧只用来垫时间轴。
+ *     keep 越大  → 候选越多，出图通常越清晰；但出图时刻离组尾越远，
+ *                  时间戳抖动最大可达 (keep-1)/帧率 秒。
+ *     keep = skip → 全组参评，清晰度收益最大，抖动也最大。
+ *     keep = 1    → 只看组内最后一帧，等于不挑（仅剩 min 过滤）。
+ *     填 0        → 关闭挑选：固定取每组第 1 帧（0、skip、2·skip…），
+ *                  仍受“最低清晰度”过滤。想要确定性时间戳时用。
+ *   建议范围 1~skip；超过 skip 时窗口跨组滑动，一般用不到。
+ *
+ * 【最低清晰度 min_score（-m，默认 0 = 全部保留）】
+ *   分数定义：先把帧缩成 thumb×thumb 的 8 位灰度图，算拉普拉斯响应
+ *   的方差（见 laplacian_var()）。边缘/纹理多 → 方差大 = 清晰；运动
+ *   模糊、失焦、大面积天空/墙面 → 方差小 = 模糊。
+ *   每组的胜者分数 < min_score 时该组整组放弃出图，用来丢掉模糊照片。
+ *   ⚠ 数值没有绝对标准：与缩略图尺寸(-b)、场景内容强相关，只能在
+ *     同一批参数下相对比较；改了 -b 阈值要重新标定。
+ *   标定方法：先用默认 0 跑一遍 → 打开输出目录旁的 sharpness_camN.csv
+ *   （每行：frame,score,chosen）看分数分布，或看日志里打印的
+ *   "score min=xx avg=xx max=xx"，把阈值定在模糊段与清晰段之间，
+ *   通常先试 min~avg 之间的某个值，跑完看丢的比例再微调。
+ *
+ * 【JPEG质量 q（-q，默认 2）】ffmpeg mjpeg 的 -q:v：2 接近视觉无损，
+ *   想减小体积可到 4~5，再大画质明显下降。范围 1~31。
+ * 【评分缩略图 thumb（-b，默认 512）】只影响打分速度与分数刻度，不
+ *   影响输出照片的分辨率（输出永远是原始分辨率重新解码的 JPEG）。
+ */
 
 /* ------------------------------------------------- progress/cancel hooks */
 
@@ -298,7 +358,13 @@ static void push_cand(Cand **v, size_t *n, size_t *cap, Cand c) {
 }
 
 /* Port of FrameExtract.cpp's decode loop: candidate test, window push,
- * and "write the sharpest of the window every `skip` source frames". */
+ * and "write the sharpest of the window every `skip` source frames".
+ *
+ * 候选判定（keep>0）：((i+keep)%skip) < keep —— 把源帧按 skip 个一组
+ * 切开后，每组只有末尾 keep 帧是候选（例 skip=8、keep=4 → 候选是组内
+ * 第 4~7 帧）。keep==0 则退化为每组第 1 帧（i%skip==0）且不挑帧。
+ * 每攒满一组（fc 到达 skip 的倍数）就把窗口里分数最高的候选标记为
+ * 胜者；胜者分数 >= min_score 才进入最终输出列表。 */
 static void sel_frame(Select *s, long long i, double score) {
     int cand = s->keep > 0
         ? (int)(((i + s->keep) % s->skip) < s->keep)
@@ -555,6 +621,177 @@ all_written:
     return 0;
 }
 
+/* ------------------------------------------- 边缘涂黑（拆解完成后自动执行） */
+
+/* 鱼眼帧中心圆外涂黑：黑边 + 紧贴黑边的失焦模糊环一并切掉。
+ * 圆心=画面中心，保留半径 = pct% × 短边 ÷ 2；同一镜头所有帧同一比例，
+ * 宁多勿少（模糊环内侧还有一圈渐进的过渡软带）。涂黑区无纹理，SfM
+ * 特征点天然落不进去，等价于给整条建模链喂了 mask。 */
+static void mask_circle(uint8_t *img, int w, int h, int pct) {
+    double cx = w * 0.5, cy = h * 0.5;
+    double r = pct * 0.01 * (double)(w < h ? w : h) * 0.5;
+    double out2 = r * r, in2 = (r - 1.5) * (r - 1.5);
+    int x0 = (int)(cx - r) - 2; if (x0 < 0) x0 = 0;
+    int x1 = (int)(cx + r) + 3; if (x1 > w) x1 = w;
+    int y0 = (int)(cy - r) - 2; if (y0 < 0) y0 = 0;
+    int y1 = (int)(cy + r) + 3; if (y1 > h) y1 = h;
+    size_t rowbytes = (size_t)w * 4;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = img + (size_t)y * rowbytes;
+        if (y < y0 || y >= y1) { memset(row, 0, rowbytes); continue; }
+        if (x0 > 0) memset(row, 0, (size_t)x0 * 4);
+        if (x1 < w) memset(row + (size_t)x1 * 4, 0, rowbytes - (size_t)x1 * 4);
+        double dy = y + 0.5 - cy, dy2 = dy * dy;
+        for (int x = x0; x < x1; x++) {
+            uint8_t *px = row + (size_t)x * 4;
+            double dx = x + 0.5 - cx;
+            double d2 = dx * dx + dy2;
+            if (d2 >= out2) {
+                px[0] = px[1] = px[2] = 0;
+            } else if (d2 > in2) {
+                double a = (r - sqrt(d2)) / 1.5;
+                if (a < 0) a = 0; else if (a > 1) a = 1;
+                px[0] = (uint8_t)(px[0] * a);
+                px[1] = (uint8_t)(px[1] * a);
+                px[2] = (uint8_t)(px[2] * a);
+            }
+        }
+    }
+}
+
+typedef struct { uint8_t *buf; size_t n, cap; } MemBuf;
+
+static void mem_write(void *ctx, void *data, int n) {
+    MemBuf *m = (MemBuf *)ctx;
+    if (m->n + (size_t)n > m->cap) {
+        m->cap = (m->n + (size_t)n) * 2;
+        m->buf = realloc(m->buf, m->cap);
+    }
+    memcpy(m->buf + m->n, data, (size_t)n);
+    m->n += (size_t)n;
+}
+
+/* 解码 → 涂黑 → 整帧一次性回写（q95 重编码，提取产物 q:v≈2，损失可忽略）。
+ * 返回 0 成功。 */
+static int mask_one_file(const wchar_t *path, int pct) {
+    char *p8 = w_to_utf8(path);
+    if (!p8) return -1;
+    int w, h;
+    uint8_t *img = stbi_load(p8, &w, &h, NULL, 4);
+    free(p8);
+    if (!img) return -1;
+    mask_circle(img, w, h, pct);
+    size_t npx = (size_t)w * h;
+    uint8_t *rgb = malloc(npx * 3);
+    if (!rgb) { free(img); return -1; }
+    for (size_t i = 0; i < npx; i++) {
+        rgb[i * 3 + 0] = img[i * 4 + 0];
+        rgb[i * 3 + 1] = img[i * 4 + 1];
+        rgb[i * 3 + 2] = img[i * 4 + 2];
+    }
+    free(img);
+    MemBuf m = {0};
+    int ok = stbi_write_jpg_to_func(mem_write, &m, w, h, 3, rgb, 95);
+    free(rgb);
+    if (!ok) { free(m.buf); return -1; }
+    FILE *f = _wfopen(path, L"wb");
+    if (!f) { free(m.buf); return -1; }
+    size_t wr = m.n ? fwrite(m.buf, 1, m.n, f) : 0;
+    fclose(f);
+    free(m.buf);
+    return wr == m.n ? 0 : -1;
+}
+
+typedef struct { wchar_t **v; size_t n, cap; } WList;
+
+static void wl_push(WList *l, const wchar_t *s) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 256;
+        l->v = realloc(l->v, l->cap * sizeof(wchar_t *));
+    }
+    l->v[l->n++] = _wcsdup(s);
+}
+
+static void wl_collect(WList *l, const wchar_t *dir) {
+    wchar_t pat[MAX_PATH * 2], full[MAX_PATH * 2];
+    WIN32_FIND_DATAW fd;
+    _snwprintf(pat, MAX_PATH * 2 - 1, L"%ls\\*", dir);
+    pat[MAX_PATH * 2 - 1] = 0;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        _snwprintf(full, MAX_PATH * 2 - 1, L"%ls\\%ls", dir, fd.cFileName);
+        full[MAX_PATH * 2 - 1] = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            wl_collect(l, full);
+        } else {
+            const wchar_t *dot = wcsrchr(fd.cFileName, L'.');
+            if (dot && (!wcsicmp(dot, L".jpg") || !wcsicmp(dot, L".jpeg")))
+                wl_push(l, full);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+typedef struct { WList *l; int pct; } MaskJob;
+
+static MaskJob *g_mjob;
+static volatile LONG g_mnext, g_mdone, g_mfail;
+static volatile int g_mcancel;
+
+static DWORD WINAPI mask_worker(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        if (g_mcancel) break;
+        LONG i = InterlockedIncrement(&g_mnext);
+        if (i > (LONG)g_mjob->l->n) break;
+        if (mask_one_file(g_mjob->l->v[i - 1], g_mjob->pct) != 0)
+            InterlockedIncrement(&g_mfail);
+        InterlockedIncrement(&g_mdone);
+    }
+    return 0;
+}
+
+/* 涂黑 outdir 下（递归）全部 jpg；返回处理张数，取消返回 -1。
+ * 多线程执行；LOG/STATUS 只由本线程（抽帧 worker）发，避免输出交错。 */
+static long long mask_all(const wchar_t *outdir, int pct) {
+    WList l = {0};
+    wl_collect(&l, outdir);
+    if (l.n == 0) return 0;
+
+    MaskJob job = { &l, pct };
+    g_mjob = &job;
+    g_mnext = g_mdone = g_mfail = 0;
+    g_mcancel = 0;
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int nt = (int)si.dwNumberOfProcessors;
+    if (nt < 1) nt = 1;
+    if (nt > 8) nt = 8;
+    HANDLE th[8];
+    int started = 0;
+    for (int i = 0; i < nt; i++) {
+        th[i] = CreateThread(NULL, 0, mask_worker, NULL, 0, NULL);
+        if (th[i]) started++;
+    }
+    for (;;) {
+        if (g_hk && g_hk->cancel && *g_hk->cancel) g_mcancel = 1;
+        STATUS(g_file_idx, 4, 0, (long long)g_mdone);
+        if (g_mcancel || g_mdone >= (LONG)l.n) break;
+        Sleep(150);
+    }
+    for (int i = 0; i < started; i++) {
+        WaitForSingleObject(th[i], INFINITE);
+        CloseHandle(th[i]);
+    }
+    for (size_t i = 0; i < l.n; i++) free(l.v[i]);
+    free(l.v);
+    g_mjob = NULL;
+    return g_mcancel ? -1 : (long long)g_mdone;
+}
+
 /* ------------------------------------------------------------------- GUI */
 
 #pragma comment(lib, "comdlg32.lib")
@@ -572,13 +809,22 @@ all_written:
 #define IDC_E_MIN    1013
 #define IDC_E_Q      1014
 #define IDC_E_OUT    1015
+#define IDC_E_MASK   1016
 #define IDC_B_ADD    1021
 #define IDC_B_REM    1022
 #define IDC_B_CLEAR  1023
 #define IDC_B_START  1024
 #define IDC_B_STOP   1025
 #define IDC_B_BROWSE 1026
+#define IDC_B_HELP   1027
 #define IDC_PBAR     1031
+/* 参数框下方的灰色小提示文本（WM_CTLCOLORSTATIC 里按此 ID 段置灰） */
+#define IDC_HINT_SKIP 1041
+#define IDC_HINT_KEEP 1042
+#define IDC_HINT_MIN  1043
+#define IDC_HINT_Q    1044
+#define IDC_HINT_MASK 1045
+#define IDC_HINT_OUT  1046
 
 typedef struct { int idx, phase, track; long long a; } StatusMsg;
 typedef struct { int idx, rc; } DoneMsg;
@@ -589,13 +835,17 @@ static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem);
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
                          double min_score, int track, int thumb, int jpeg_q,
-                         const wchar_t *hw_force, int file_idx);
+                         int mask_pct, const wchar_t *hw_force, int file_idx);
 
 static HWND g_hwnd, g_list, g_log, g_pbar;
-static HFONT g_font;
+static HFONT g_font, g_font_hint;
 static wchar_t (*g_paths)[MAX_PATH];
 static int g_npaths, g_cappaths;
 static int g_running, g_files_done, g_files_total;
+/* 每个文件的"清晰帧"列累计值：cam0/cam1 依次累加，避免后一条轨
+ * 把前面的张数覆盖成自己的（曾让单路 MP4 显示"完成 0 张"） */
+static int g_cnt_idx = -1;
+static long long g_cnt_total;
 
 static void gui_log(void *user, const char *line) {
     (void)user;
@@ -618,9 +868,16 @@ static void gui_fdone(void *user, int idx, int rc) {
 }
 
 static void append_log(const char *utf8) {
-    int len = GetWindowTextLengthA(g_log);
-    SendMessageA(g_log, EM_SETSEL, len, len);
-    SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)utf8);
+    /* LOG 管线传的是 UTF-8 字节，必须转宽字符后用 W 版消息写入；
+     * 走 A 版会被 ANSI(GBK) 代码页重新解释，中文路径就成了“瀹夊窘涓洂”。 */
+    int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wn <= 0) return;
+    wchar_t *w = malloc((size_t)wn * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wn);
+    int len = GetWindowTextLengthW(g_log);
+    SendMessageW(g_log, EM_SETSEL, len, len);
+    SendMessageW(g_log, EM_REPLACESEL, FALSE, (LPARAM)w);
+    free(w);
 }
 
 static void list_add(const wchar_t *path) {
@@ -651,13 +908,23 @@ static DWORD WINAPI worker_proc(LPVOID param) {
     hk.cancel = &g_cancel;
     g_hk = &hk;
 
+    /* 读取界面参数。各参数的完整语义、取值建议见文件顶部的
+     * “参数详解（速查）”注释块。 */
     int translated = 0;
-    int skip = GetDlgItemInt(g_hwnd, IDC_E_SKIP, &translated, FALSE);
+    int skip = GetDlgItemInt(g_hwnd, IDC_E_SKIP, &translated, FALSE); /* 抽帧间隔 */
     if (!translated || skip < 1) skip = DEF_SKIP;
+    /* 锐度窗口：留空/非法 → 自动取 skip/2；填 0 → 关闭挑帧
+     * （每组固定取第 1 帧，只剩最低清晰度过滤）。 */
     int keep = GetDlgItemInt(g_hwnd, IDC_E_KEEP, &translated, FALSE);
     if (!translated || keep < 0) keep = (int)(0.5 * skip + 0.5); /* empty = auto */
-    int q = GetDlgItemInt(g_hwnd, IDC_E_Q, &translated, FALSE);
+    int q = GetDlgItemInt(g_hwnd, IDC_E_Q, &translated, FALSE);   /* JPEG质量 */
     if (!translated || q < 1 || q > 31) q = DEF_JPEG_Q;
+    /* 涂黑半径%：拆解完成后把每张图中心圆外涂黑（切黑边+失焦模糊环）。
+     * 留空/非法 = 默认 DEF_MASK；0 = 不涂黑。 */
+    int maskpct = GetDlgItemInt(g_hwnd, IDC_E_MASK, &translated, FALSE);
+    if (!translated || maskpct < 0 || maskpct > 100) maskpct = DEF_MASK;
+    /* 最低清晰度：拉普拉斯方差下限，0 = 不过滤。参考输出目录旁的
+     * sharpness_camN.csv 分数分布来定值。 */
     double minscore = 0.0;
     {
         wchar_t buf[64];
@@ -683,7 +950,7 @@ static DWORD WINAPI worker_proc(LPVOID param) {
             _snwprintf(outdir, n, L"%ls\\%ls", outbase, stem);
         }
         int rc = process_input(ffmpeg, g_paths[i], outdir, skip, keep, minscore,
-                               -1, DEF_THUMB, q, NULL, i);
+                               -1, DEF_THUMB, q, maskpct, NULL, i);
         free(outdir);
         gui_fdone(NULL, i, rc);
         if (rc == 2) break; /* cancelled */
@@ -701,6 +968,7 @@ static void start_batch(void) {
     g_cancel = 0;
     g_files_done = 0;
     g_files_total = g_npaths;
+    g_cnt_idx = -1;
     for (int i = 0; i < g_npaths; i++)
         ListView_SetItemText(g_list, i, 1, (LPWSTR)L"等待");
     SendMessage(g_pbar, PBM_SETPOS, 0, 0);
@@ -720,19 +988,21 @@ static void layout(HWND wnd) {
     GetClientRect(wnd, &rc);
     int w = rc.right, h = rc.bottom;
     int x = 10, y = 10;
-    MoveWindow(GetDlgItem(wnd, IDC_E_SKIP), x + 66, y, 40, 23, TRUE); x += 124;
-    MoveWindow(GetDlgItem(wnd, IDC_E_KEEP), x + 66, y, 40, 23, TRUE); x += 124;
-    MoveWindow(GetDlgItem(wnd, IDC_E_MIN), x + 78, y, 48, 23, TRUE); x += 142;
-    MoveWindow(GetDlgItem(wnd, IDC_E_Q), x + 70, y, 34, 23, TRUE); x += 114;
-    MoveWindow(GetDlgItem(wnd, IDC_E_OUT), x + 66, y, w - x - 88, 23, TRUE);
+    MoveWindow(GetDlgItem(wnd, IDC_E_SKIP), x + 62, y, 36, 23, TRUE); x += 110;
+    MoveWindow(GetDlgItem(wnd, IDC_E_KEEP), x + 62, y, 36, 23, TRUE); x += 110;
+    MoveWindow(GetDlgItem(wnd, IDC_E_MIN), x + 70, y, 44, 23, TRUE); x += 126;
+    MoveWindow(GetDlgItem(wnd, IDC_E_Q), x + 64, y, 30, 23, TRUE); x += 92;
+    MoveWindow(GetDlgItem(wnd, IDC_E_MASK), x + 44, y, 40, 23, TRUE); x += 92;
+    MoveWindow(GetDlgItem(wnd, IDC_E_OUT), x + 64, y, w - x - 88, 23, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_BROWSE), w - 78, y, 68, 23, TRUE);
-    y += 34;
+    y += 74; /* 跳过参数框下方的三行提示文本 */
     MoveWindow(GetDlgItem(wnd, IDC_B_ADD), 10, y, 90, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_REM), 105, y, 90, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_CLEAR), 200, y, 60, 26, TRUE);
+    MoveWindow(GetDlgItem(wnd, IDC_B_HELP), 265, y, 90, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_START), w - 180, y, 80, 26, TRUE);
     MoveWindow(GetDlgItem(wnd, IDC_B_STOP), w - 90, y, 80, 26, TRUE);
-    MoveWindow(g_pbar, 270, y + 4, w - 460, 18, TRUE);
+    MoveWindow(g_pbar, 365, y + 4, w - 555, 18, TRUE);
     y += 36;
     int lh = (h - y) * 45 / 100;
     MoveWindow(g_list, 10, y, w - 20, lh, TRUE);
@@ -751,6 +1021,13 @@ static HWND make_ctl(HWND parent, const wchar_t *cls, const wchar_t *text,
 static void add_label(HWND parent, const wchar_t *text, int x, int w) {
     HWND l = make_ctl(parent, L"STATIC", text, SS_LEFT, 0);
     SetWindowPos(l, 0, x, 13, w, 18, SWP_NOZORDER);
+}
+
+/* 参数框下方的小号灰色提示文本；颜色由 WM_CTLCOLORSTATIC 按 ID 段处理 */
+static void add_hint(HWND parent, const wchar_t *text, int x, int w, int id) {
+    HWND l = make_ctl(parent, L"STATIC", text, SS_LEFT, id);
+    SendMessageW(l, WM_SETFONT, (WPARAM)g_font_hint, TRUE);
+    SetWindowPos(l, 0, x, 34, w, 48, SWP_NOZORDER);
 }
 
 static void add_files_dialog(HWND owner) {
@@ -1110,17 +1387,30 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                              DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
                              L"Microsoft YaHei UI");
-        add_label(wnd, L"抽帧间隔", 10, 62);
-        add_label(wnd, L"锐度窗口", 134, 62);
-        add_label(wnd, L"最低清晰度", 258, 76);
-        add_label(wnd, L"JPEG质量", 400, 66);
-        add_label(wnd, L"输出目录", 514, 62);
+        g_font_hint = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                                  L"Microsoft YaHei UI");
+        add_label(wnd, L"抽帧间隔", 10, 58);
+        add_label(wnd, L"锐度窗口", 120, 58);
+        add_label(wnd, L"最低清晰度", 230, 66);
+        add_label(wnd, L"JPEG质量", 356, 60);
+        add_label(wnd, L"涂黑%", 448, 40);
+        add_label(wnd, L"输出目录", 540, 60);
+        add_hint(wnd, L"每N帧出1张\n（≈帧率÷N）", 10, 108, IDC_HINT_SKIP);
+        add_hint(wnd, L"组末N帧挑最清晰\n留空=间隔÷2\n0=不挑", 120, 108, IDC_HINT_KEEP);
+        add_hint(wnd, L"胜者分数低于此值丢弃\n0=不过滤；阈值参考\n旁 sharpness_cam0.csv",
+                 230, 124, IDC_HINT_MIN);
+        add_hint(wnd, L"越小越清晰\n2≈高质量", 356, 90, IDC_HINT_Q);
+        add_hint(wnd, L"拆解后圆外涂黑(黑边+模糊环)\n越小切越多\n0=不涂黑", 448, 86, IDC_HINT_MASK);
+        add_hint(wnd, L"留空=输出到各视频旁\n<视频名>_sharp\\", 540, 260, IDC_HINT_OUT);
         make_ctl(wnd, L"EDIT", L"8", WS_BORDER | ES_AUTOHSCROLL, IDC_E_SKIP);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_KEEP);
         make_ctl(wnd, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MIN);
         make_ctl(wnd, L"EDIT", L"2", WS_BORDER | ES_AUTOHSCROLL, IDC_E_Q);
+        make_ctl(wnd, L"EDIT", L"88", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_OUT);
         make_ctl(wnd, L"BUTTON", L"浏览…", 0, IDC_B_BROWSE);
+        make_ctl(wnd, L"BUTTON", L"参数说明", 0, IDC_B_HELP);
         make_ctl(wnd, L"BUTTON", L"添加文件", 0, IDC_B_ADD);
         make_ctl(wnd, L"BUTTON", L"移除选中", 0, IDC_B_REM);
         make_ctl(wnd, L"BUTTON", L"清空", 0, IDC_B_CLEAR);
@@ -1183,6 +1473,39 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_running) { ListView_DeleteAllItems(g_list); g_npaths = 0; }
             break;
         case IDC_B_BROWSE: browse_outdir(wnd); break;
+        case IDC_B_HELP:
+            MessageBoxW(wnd,
+                L"三个核心参数的关系：视频按\u201c抽帧间隔\u201d分组，每组末尾\u201c锐度窗口\u201d\n"
+                L"帧里挑最清晰的一张出图；胜者分数低于\u201c最低清晰度\u201d则整组丢弃。\n\n"
+                L"【抽帧间隔】（默认 8）\n"
+                L"每 N 个源帧输出 1 张，出图密度 ≈ 帧率÷N（25fps、N=8 → 约3张/秒）。\n"
+                L"想更密调小、更稀调大，与清晰度无关。\n\n"
+                L"【锐度窗口】（留空 = 间隔÷2，填 0 = 不挑）\n"
+                L"每组只有末尾 N 帧参与评分，输出其中分数最高的一张。\n"
+                L"窗口越大出图越清晰，但时间戳抖动越大（最多偏 N-1 帧）。\n"
+                L"建议范围 1~间隔；窗口=间隔时全组参评；填 0 固定取每组第 1 帧。\n\n"
+                L"【最低清晰度】（默认 0 = 不过滤）\n"
+                L"清晰度分 = 缩略图上拉普拉斯响应的方差：边缘细节多分数高，\n"
+                L"运动模糊/失焦分数低。用于丢掉模糊照片。\n"
+                L"定值方法：先用 0 跑一遍，打开输出目录旁的 sharpness_cam0.csv\n"
+                L"看分数分布（日志也打印 score min/avg/max），把阈值定在模糊段\n"
+                L"与清晰段之间，通常先试 min~avg 之间的值，再按丢弃比例微调。\n"
+                L"注意：数值与评分缩略图尺寸(-b)和场景内容相关，改参数要重标。\n\n"
+                L"【JPEG质量】（默认 2）ffmpeg -q:v，越小越清晰，2 接近视觉无损。\n\n"
+                L"【涂黑%】（默认 88，0 = 不涂黑）\n"
+                L"拆帧完成后把每张图中心圆外的像素涂黑：圆心=画面中心，\n"
+                L"保留半径 = 百分数×短边÷2。用于切掉鱼眼黑边和紧贴黑边的\n"
+                L"失焦模糊环；涂黑区不产生图像梯度，SfM 特征点天然落不进\n"
+                L"去，等价于给建模链喂 mask。\n"
+                L"数字越小切得越多：84 比 88 每个方向多切 4% 半径，保留\n"
+                L"面积 ≈ 百分数的平方（88%→77%，84%→71%）。\n"
+                L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 88 已留\n"
+                L"余量；若出图仍见模糊边，往 84~86 方向试。涂黑走多线程，\n"
+                L"大批量会多花一点时间。\n\n"
+                L"【输出目录】留空 = 在各视频旁建 <视频名>_sharp\\。\n"
+                L"双目文件（OSV）分 cam0、cam1 子目录；单路视频直接放入。",
+                L"参数说明", MB_OK | MB_ICONINFORMATION);
+            break;
         case IDC_B_START: start_batch(); break;
         case IDC_B_STOP: {
             g_cancel = 1;
@@ -1207,9 +1530,15 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             _snwprintf(text, 128, L"cam%d 评分中 %lld 帧", m->track, m->a);
         else if (m->phase == 2)
             _snwprintf(text, 128, L"cam%d 输出中 %lld 张", m->track, m->a);
+        else if (m->phase == 4)
+            _snwprintf(text, 128, L"涂黑中 %lld 张", m->a);
         else {
             _snwprintf(text, 128, L"cam%d 已选 %lld 张", m->track, m->a);
-            ListView_SetItemText(g_list, m->idx, 2, (LPWSTR)(text + 8));
+            if (m->idx != g_cnt_idx) { g_cnt_idx = m->idx; g_cnt_total = 0; }
+            g_cnt_total += m->a;
+            wchar_t cnt[32];
+            _snwprintf(cnt, 32, L"%lld 张", g_cnt_total);
+            ListView_SetItemText(g_list, m->idx, 2, cnt);
         }
         ListView_SetItemText(g_list, m->idx, 1, text);
         free(m);
@@ -1238,6 +1567,18 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(GetDlgItem(wnd, IDC_B_CLEAR), TRUE);
         append_log("—— 批处理结束 ——\n");
         return 0;
+    case WM_CTLCOLORSTATIC:
+        /* 参数提示小字显示为灰色，与正常标签区分 */
+        {
+            int id = GetDlgCtrlID((HWND)lp);
+            if (id >= IDC_HINT_SKIP && id <= IDC_HINT_OUT) {
+                static HBRUSH br = NULL;
+                if (!br) br = GetSysColorBrush(COLOR_WINDOW);
+                SetTextColor((HDC)wp, RGB(96, 96, 96));
+                return (LRESULT)(INT_PTR)br;
+            }
+        }
+        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1263,7 +1604,7 @@ static int gui_run(void) {
     g_hwnd = CreateWindowW(L"OsvSharpWnd",
                            L"osvsharp — OSV 清晰帧批量提取（双击列表项预览）",
                            WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 1000, 680,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1120, 680,
                            NULL, NULL, wc.hInstance, NULL);
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -1282,13 +1623,20 @@ static void usage(void) {
         "osvsharp - video/OSV in, sharp frames out (pure C + ffmpeg subprocess)\n\n"
         "usage: osvsharp <video1> [video2 ...] [options]\n"
         "  Drag & drop video files onto osvsharp.exe works: output goes to\n"
-        "  <video dir>/<video name>_sharp\\cam0, cam1.\n\n"
-        "  -s, --skip <n>       write one frame every n source frames (default 8)\n"
-        "  -k, --keep <n>       sharpest-of-window size (default: skip/2)\n"
-        "  -m, --min-score <f>  absolute Laplacian-variance floor (default 0)\n"
+        "  <video dir>/<video name>_sharp (cam0/cam1 subdirs for two-stream\n"
+        "  files like .OSV; attached-pic cover streams are ignored).\n\n"
+        "  -s, --skip <n>       抽帧间隔：每 n 个源帧输出 1 张（默认 8）\n"
+        "  -k, --keep <n>       锐度窗口：每组末尾 n 帧里挑最清晰的一张\n"
+        "                       （默认 skip/2；0 = 不挑，固定取每组第 1 帧）\n"
+        "  -m, --min-score <f>  最低清晰度：胜者分数（拉普拉斯方差）低于\n"
+        "                       此值则该组放弃出图（默认 0 = 不过滤；参考\n"
+        "                       输出目录 sharpness_camN.csv 的分数分布定值）\n"
         "  -t, --track <n>      video track 0/1 (default: both)\n"
-        "  -q, --jpeg-q <n>     mjpeg quality, ffmpeg -q:v (default 2)\n"
-        "  -b, --thumb <n>      scoring thumbnail size (default 512)\n"
+        "  -q, --jpeg-q <n>     JPEG质量，ffmpeg -q:v，越小越清晰（默认 2）\n"
+        "  -b, --thumb <n>      评分缩略图边长，只影响打分与分数刻度（默认 512）\n"
+        "      -mask <n>        边缘涂黑：拆解完成后把每张图中心圆外涂黑，\n"
+        "                       保留半径=n%%×短边÷2，越小切得越多\n"
+        "                       （默认 88；0 = 不涂黑）\n"
         "  -o, --out <dir>      output directory (default: <video>_sharp)\n"
         "      --ffmpeg <path>  ffmpeg executable\n"
         "      --hwaccel <name> force cuda/vulkan/d3d11va/none\n"
@@ -1337,23 +1685,98 @@ static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem) {
     } else wcscpy(stem, base);
 }
 
+/* Enumerate real video streams via `ffmpeg -i` stderr (header parse only, no
+ * decode).  Non-attached-pic video stream indices go into idx[]; *nattach
+ * counts attached-pic cover-art video streams (DJI Avata360 MP4 carries one
+ * as 0:v:1 -- running the OSV two-track logic on it yields an empty cam1).
+ * Returns the count written to idx[], or -1 when nothing parseable came out
+ * (caller then falls back to the old assume-two-tracks behaviour). */
+static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
+                               int *idx, int maxn, int *nattach) {
+    *nattach = 0;
+    Cmd c = {0};
+    cmd_add(&c, ffmpeg);
+    cmd_add(&c, L"-nostdin");
+    cmd_add(&c, L"-i");
+    cmd_add(&c, input);
+    Child ch;
+    if (spawn(c.s, &ch, 2) != 0) { free(c.s); return -1; }
+    free(c.s);
+
+    size_t len = 0, cap = 65536;
+    char *buf = malloc(cap);
+    for (;;) {
+        if (len == cap) { cap *= 2; buf = realloc(buf, cap); }
+        DWORD got = 0;
+        if (!ReadFile(ch.r, buf + len, (DWORD)(cap - len), &got, NULL) || got == 0)
+            break;
+        len += got;
+    }
+    buf[len < cap ? len : cap - 1] = 0;
+    child_wait(&ch);
+
+    int n = 0, nat = 0, parsed = 0;
+    char *line = buf;
+    while (line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *sp = strstr(line, "Stream #");
+        if (sp && strstr(sp, "Video:")) {
+            int si = -1;
+            char *colon = strchr(sp + 8, ':');   /* "Stream #0:N[...]: ..." */
+            if (colon && sscanf(colon + 1, "%d", &si) == 1 && si >= 0) {
+                parsed = 1;
+                if (strstr(sp, "attached pic"))
+                    nat++;
+                else if (n < maxn)
+                    idx[n++] = si;
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    free(buf);
+    *nattach = nat;
+    return parsed ? n : -1;
+}
+
 /* process one input end-to-end; 0 ok, 1 failed, 2 cancelled */
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
                          double min_score, int track, int thumb, int jpeg_q,
-                         const wchar_t *hw_force, int file_idx) {
+                         int mask_pct, const wchar_t *hw_force, int file_idx) {
     g_file_idx = file_idx;
     Ctx cx = { ffmpeg, input, L"", thumb, jpeg_q };
     {
         char *i8 = w_to_utf8(input), *o8 = w_to_utf8(outdir);
-        LOG("=== %s ===\n  outdir: %s\n  skip=%d keep=%d min_score=%.1f q=%d\n",
-            i8, o8, skip, keep, min_score, jpeg_q);
+        LOG("=== %s ===\n  outdir: %s\n  skip=%d keep=%d min_score=%.1f q=%d mask=%d%%\n",
+            i8, o8, skip, keep, min_score, jpeg_q, mask_pct);
         free(i8); free(o8);
     }
     mkdirs_w(outdir);
 
+    /* 只处理真实视频流：普通 MP4 可能带 attached-pic 封面流（如 DJI
+     * Avata360 的 0:v:1），按 OSV 双目逻辑跑它只会得到空的 cam1。
+     * 流列表解析失败时退回老行为（假定 0、1 两条轨）。 */
     int tracks[2] = { 0, 1 }, ntracks = 2;
-    if (track >= 0) { tracks[0] = track; ntracks = 1; }
+    {
+        int vsidx[4], nattach = 0;
+        int nreal = probe_video_streams(ffmpeg, input, vsidx, 4, &nattach);
+        if (nreal > 0) {
+            ntracks = nreal > 2 ? 2 : nreal;
+            tracks[0] = vsidx[0];
+            tracks[1] = ntracks > 1 ? vsidx[1] : -1;
+            if (nattach > 0)
+                LOG("video streams: %d real, %d attached-pic cover ignored\n",
+                    nreal, nattach);
+        }
+    }
+    if (track >= 0) {
+        if (track < ntracks) { tracks[0] = tracks[track]; ntracks = 1; }
+        else {
+            LOG("[track %d] not present, single-camera file -- skipped\n", track);
+            ntracks = 0;
+        }
+    }
 
     ULONGLONG t0 = GetTickCount64();
     int rc = 0;
@@ -1362,7 +1785,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         int multi = ntracks > 1;
         size_t dlen = wcslen(outdir) + 16;
         wchar_t *dir = malloc(dlen * sizeof(wchar_t));
-        wchar_t camid[2] = { (wchar_t)(L'0' + tr), 0 };
+        wchar_t camid[2] = { (wchar_t)(L'0' + ti), 0 };
         _snwprintf(dir, dlen, L"%ls%s%s", outdir, multi ? L"\\cam" : L"",
                    multi ? camid : L"");
 
@@ -1370,15 +1793,15 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         if (hw_force) {
             cx.hw = wcscmp(hw_force, L"none") ? hw_force : L"";
         } else {
-            STATUS(file_idx, 0, tr, 0);
+            STATUS(file_idx, 0, ti, 0);
             hw = probe_hwaccel(&cx, tr, 1); /* printing handled below */
             if (!hw) {
-                if (tr == 0) {
-                    LOG("no decodable video track 0 in this file\n");
+                if (ti == 0) {
+                    LOG("no decodable video track %d in this file\n", tr);
                     free(dir);
                     return 1;
                 }
-                LOG("[track 1] not present, single-camera file -- skipped\n");
+                LOG("[track %d] not present, single-camera file -- skipped\n", ti);
                 free(dir);
                 break;
             }
@@ -1390,7 +1813,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                 hw_force ? " (forced)" : "");
             free(h8);
         }
-        LOG("[track %d] pass A: scoring frames...\n", tr);
+        LOG("[track %d] pass A: scoring frames...\n", ti);
 
         Select sel;
         sel_init(&sel, skip, keep, min_score);
@@ -1406,12 +1829,13 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
             sum += v;
         }
         double avg = sel.nall ? sum / (double)sel.nall : 0.0;
+        if (!sel.nall) { mn = avg = mx = 0.0; }   /* empty csv: don't print ±1e30 */
         LOG("[track %d] decoded %lld frames, %zu candidates, %zu winners\n"
             "          score min=%.1f avg=%.1f max=%.1f\n",
-            tr, decoded, sel.nall, sel.nwin, mn, avg, mx);
+            ti, decoded, sel.nall, sel.nwin, mn, avg, mx);
 
         wchar_t csvp[MAX_PATH * 2];
-        _snwprintf(csvp, MAX_PATH * 2, L"%ls\\sharpness_cam%d.csv", outdir, tr);
+        _snwprintf(csvp, MAX_PATH * 2, L"%ls\\sharpness_cam%d.csv", outdir, ti);
         FILE *csv = _wfopen(csvp, L"wb");
         if (csv) {
             fprintf(csv, "frame,score,chosen\n");
@@ -1422,14 +1846,28 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         }
 
         mkdirs_w(dir);
-        STATUS(file_idx, 3, tr, (long long)sel.nwin);
-        LOG("[track %d] pass B: writing %zu jpegs...\n", tr, sel.nwin);
+        STATUS(file_idx, 3, ti, (long long)sel.nwin);
+        LOG("[track %d] pass B: writing %zu jpegs...\n", ti, sel.nwin);
         int pb = pass_b(&cx, tr, sel.win, sel.nwin, dir);
         if (pb == -2) { rc = 2; free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
 
         free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir);
         if (hw) free(hw);
+    }
+    /* 拆解完成，立即按 mask_pct% 把输出帧的圆外涂黑（多线程，可取消） */
+    if (rc == 0 && mask_pct > 0) {
+        LOG("edge mask: blackening all jpegs at %d%%...\n", mask_pct);
+        long long nm = mask_all(outdir, mask_pct);
+        if (nm < 0) {
+            LOG("edge mask: cancelled\n");
+            rc = 2;
+        } else if (g_mfail) {
+            LOG("edge mask: %lld jpg done, %d failed\n", nm, (int)g_mfail);
+            if (rc == 0) rc = 1;
+        } else {
+            LOG("edge mask: %lld jpg blackened\n", nm);
+        }
     }
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
     return rc;
@@ -1443,6 +1881,7 @@ int wmain(int argc, wchar_t **argv) {
     int ninputs = 0;
     const wchar_t *outdir_arg = NULL, *ffmpeg_arg = NULL, *hw_force = NULL;
     int skip = DEF_SKIP, keep = -1, track = -1, thumb = DEF_THUMB, jpeg_q = DEF_JPEG_Q;
+    int mask_pct = DEF_MASK;
     double min_score = 0.0;
     int nopause = 0;
 
@@ -1455,6 +1894,7 @@ int wmain(int argc, wchar_t **argv) {
         else if (!wcscmp(a, L"-t") || !wcscmp(a, L"--track")) track = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-q") || !wcscmp(a, L"--jpeg-q")) jpeg_q = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-b") || !wcscmp(a, L"--thumb")) thumb = _wtoi(argv[++i]);
+        else if (!wcscmp(a, L"-mask") || !wcscmp(a, L"--mask")) mask_pct = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-o") || !wcscmp(a, L"--out")) outdir_arg = argv[++i];
         else if (!wcscmp(a, L"--ffmpeg")) ffmpeg_arg = argv[++i];
         else if (!wcscmp(a, L"--hwaccel")) hw_force = argv[++i];
@@ -1465,6 +1905,7 @@ int wmain(int argc, wchar_t **argv) {
     if (skip < 1) skip = 1;
     if (keep < 0) keep = (int)(0.5 * skip + 0.5);
     if (thumb < 32) thumb = 32;
+    if (mask_pct < 0 || mask_pct > 100) mask_pct = DEF_MASK;
 
     wchar_t *ffmpeg = find_ffmpeg(ffmpeg_arg);
 
@@ -1507,7 +1948,7 @@ int wmain(int argc, wchar_t **argv) {
             _snwprintf(outdir, n, L"%ls\\%ls_sharp", dir, stem);
         }
         if (process_input(ffmpeg, inputs[i], outdir, skip, keep, min_score,
-                          track, thumb, jpeg_q, hw_force, i) != 0)
+                          track, thumb, jpeg_q, mask_pct, hw_force, i) != 0)
             failed++;
         free(outdir);
     }
