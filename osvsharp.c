@@ -68,27 +68,36 @@
 #define DEF_JPEG_Q  2      /* ffmpeg mjpeg -q:v (lower = better)            */
 #define DEF_THUMB   512    /* spirula's thumbnail size                      */
 #define DEF_MASK    95     /* 涂黑保留半径百分数（0=关），抽帧编码时同步执行  */
+/* 动态间隔模式（--diff > 0 启用）的出图间隔伸缩范围（源帧数） */
+#define DEF_ADAPT_MIN_GAP 4    /* 最密 ≈6 张/秒 @25fps（快移段防帧数爆炸） */
+#define DEF_ADAPT_MAX_GAP 32   /* 最稀兜底：静止段最多隔 32 帧出一张      */
 
 /* --------------------------------------------------------- 参数详解（速查）
  *
  * 界面输入框（括号内为等价命令行参数）的含义与设置方法。
- * 三个核心参数的关系：源视频按“抽帧间隔 skip”分组，每组末尾 keep 帧
- * 评清晰度分，最清晰的一张出图；分数低于“最低清晰度”的整组放弃。
+ * 两种选帧模式：
+ *   固定间隔（默认）：源视频按“抽帧间隔 skip”分组，每组末尾 keep
+ *     帧评清晰度分，最清晰的一张出图；分数低于“最低清晰度”的整组放弃。
+ *   动态间隔（“变化阈值”>0 启用）：每帧与上一张出图帧算平均灰度差，
+ *     变化攒够阈值才结算出图（窗内仍挑最清晰，仍受最低清晰度过滤）；
+ *     变化快→出图密、静止→自动变稀，间隔在 min_gap~max_gap 帧间伸缩。
  *
  * ┌────────────┬──────┬────────────┬────────────────────────────────┐
  * │ 界面标签    │ 参数  │ 默认        │ 作用                           │
  * ├────────────┼──────┼────────────┼────────────────────────────────┤
  * │ 抽帧间隔    │ skip │ 8          │ 每 skip 帧输出 1 张             │
  * │ 锐度窗口    │ keep │ 留空=skip/2 │ 每组末尾 keep 帧里挑最清晰      │
+ * │ 变化阈值    │ diff │ 0（固定）   │ >0 启用动态间隔，见下           │
  * │ 最低清晰度  │ min  │ 0（不过滤） │ 分数低于此值的胜者不出图        │
  * │ JPEG质量    │ q    │ 2          │ mjpeg -q:v，越小越清晰          │
  * │ 评分缩略图  │thumb │ 512        │ 打分用的灰度图边长，影响分数刻度│
- * │ 涂黑半径%   │ mask │ 95（0=关） │ 抽帧时圆外涂黑，切黑边+模糊环   │
+ * │ 涂黑半径%   │ mask │ 95（0=关） │ 抽帧时圆外涂黑（仅双目生效）    │
  * └────────────┴──────┴────────────┴────────────────────────────────┘
  *
  * 【抽帧间隔 skip（-s，默认 8）】
  *   决定出图密度：输出节奏 ≈ 帧率 ÷ skip。25fps、skip=8 → 约 3 张/秒；
  *   skip=4 约 6 张/秒。想要更密调小、更稀调大，对清晰度本身无影响。
+ *   动态间隔模式下此参数不参与。
  *
  * 【锐度窗口 keep（-k，界面留空 = 自动取 skip/2 四舍五入）】
  *   每组 skip 帧里只有“末尾 keep 帧”参与评分，从中挑分数最高的一张
@@ -101,6 +110,21 @@
  *     填 0        → 关闭挑选：固定取每组第 1 帧（0、skip、2·skip…），
  *                  仍受“最低清晰度”过滤。想要确定性时间戳时用。
  *   建议范围 1~skip；超过 skip 时窗口跨组滑动，一般用不到。
+ *   动态间隔模式下此参数不参与。
+ *
+ * 【变化阈值 diff（--diff，默认 0 = 固定间隔模式）】
+ *   填大于 0 的数即切换为“动态间隔”：每个候选帧与上一张出图帧的
+ *   缩略图算平均灰度差（MAD，0~255 刻度，记进 csv 的 diff 列），
+ *   差值攒够阈值才关窗出图——窗内仍挑最清晰一张，仍受“最低清晰度”
+ *   过滤。变化快→出图密、静止→自动变稀，相邻出图帧的画面变化量
+ *   大致恒定，给 SfM 喂图最合适。
+ *   出图间隔被钳在 min_gap~max_gap 帧之间（--min-gap/--max-gap，
+ *   默认 4~32；25fps 下 ≈ 每秒 0.8~6 张），急速运动不会帧数爆炸，
+ *   长静止段也有兜底出图。此模式下 skip/keep 均被忽略。
+ *   ⚠ 阈值刻度与场景内容、缩略图尺寸(-b)相关：先用固定模式跑一遍，
+ *     看 csv 里 diff 列在静止段/走动段的分布，把阈值定在两者之间；
+ *     调大 → 出图更稀，调小 → 更密。实测 8K 行走素材：8 ≈ 默认密度
+ *     （约 3 张/秒），12 约减半，常用 5~12。
  *
  * 【最低清晰度 min_score（-m，默认 0 = 全部保留）】
  *   分数定义：先把帧缩成 thumb×thumb 的 8 位灰度图，算拉普拉斯响应
@@ -331,13 +355,32 @@ static double laplacian_var(const uint8_t *g, int S) {
     return sqr / (double)n - mean * mean;
 }
 
+/* Mean absolute difference of two 8-bit luma thumbnails (0~255 scale):
+ * 动态间隔模式的帧间变化量。只在候选帧上算（缩略图已由 scale 滤镜
+ * 重度平滑过，噪声残留远小于真实运动）。 */
+static double frame_diff_mad(const uint8_t *a, const uint8_t *b, size_t n) {
+    unsigned long long sum = 0;
+    for (size_t k = 0; k < n; k++)
+        sum += a[k] > b[k] ? (unsigned)(a[k] - b[k]) : (unsigned)(b[k] - a[k]);
+    return n ? (double)sum / (double)n : 0.0;
+}
+
 /* ------------------------------------------- sliding-window frame selection */
 
-typedef struct { long long idx; double score; } Cand;
+typedef struct { long long idx; double score; double diff; } Cand;
 
 typedef struct {
     int skip, keep;
     double min_score;
+    /* 动态间隔模式（diff_th > 0 启用）：帧间差攒够阈值才关窗出图，
+     * 间隔在 min_gap~max_gap 源帧之间伸缩；skip/keep 被忽略。 */
+    int adaptive;
+    double diff_th;
+    int min_gap, max_gap, thumb;
+    uint8_t *last_out;                  /* 上一张出图帧的缩略图（差值基准）*/
+    uint8_t *best_thumb;                /* 当前窗内最清晰候选的缩略图      */
+    long long last_out_idx;             /* -1 = 还没有基准帧               */
+    long long win_start;                /* 当前窗首个候选的帧号            */
     Cand *win;  size_t nwin,  capwin;   /* chosen frames                */
     Cand *all;  size_t nall,  capall;   /* every candidate, for the csv */
     char  *chosen;                      /* parallel to all              */
@@ -345,13 +388,29 @@ typedef struct {
     long long fc;
 } Select;
 
-static void sel_init(Select *s, int skip, int keep, double min_score) {
+static void sel_init(Select *s, int skip, int keep, double min_score,
+                     double diff_th, int min_gap, int max_gap, int thumb) {
     memset(s, 0, sizeof(*s));
     s->skip = skip;
     s->keep = keep;
     s->min_score = min_score;
-    s->wcap = keep > 0 ? keep : 1;
+    s->diff_th = diff_th;
+    s->adaptive = diff_th > 0.0;
+    s->min_gap = min_gap;
+    s->max_gap = max_gap;
+    s->thumb = thumb;
+    s->last_out_idx = -1;
+    /* 动态模式窗长上限 = max_gap；固定模式沿用 keep（keep==0 = 不挑）*/
+    s->wcap = s->adaptive ? max_gap : (keep > 0 ? keep : 1);
     s->w = malloc(sizeof(Cand) * (size_t)s->wcap);
+    size_t fsz = (size_t)thumb * thumb;
+    s->last_out = malloc(fsz);
+    s->best_thumb = malloc(fsz);
+}
+
+static void sel_free(Select *s) {
+    free(s->win); free(s->all); free(s->chosen); free(s->w);
+    free(s->last_out); free(s->best_thumb);
 }
 
 static void push_cand(Cand **v, size_t *n, size_t *cap, Cand c) {
@@ -362,37 +421,9 @@ static void push_cand(Cand **v, size_t *n, size_t *cap, Cand c) {
     (*v)[(*n)++] = c;
 }
 
-/* Port of FrameExtract.cpp's decode loop: candidate test, window push,
- * and "write the sharpest of the window every `skip` source frames".
- *
- * 候选判定（keep>0）：((i+keep)%skip) < keep —— 把源帧按 skip 个一组
- * 切开后，每组只有末尾 keep 帧是候选（例 skip=8、keep=4 → 候选是组内
- * 第 4~7 帧）。keep==0 则退化为每组第 1 帧（i%skip==0）且不挑帧。
- * 每攒满一组（fc 到达 skip 的倍数）就把窗口里分数最高的候选标记为
- * 胜者；胜者分数 >= min_score 才进入最终输出列表。 */
-static void sel_frame(Select *s, long long i, double score) {
-    int cand = s->keep > 0
-        ? (int)(((i + s->keep) % s->skip) < s->keep)
-        : (int)((i % s->skip) == 0);
-    if (!cand) { s->fc++; return; }
-
-    push_cand(&s->all, &s->nall, &s->capall, (Cand){ i, score });
-    s->chosen = realloc(s->chosen, s->nall);
-    s->chosen[s->nall - 1] = 0;
-
-    if (s->wsize == s->wcap) {
-        memmove(s->w, s->w + 1, sizeof(Cand) * (size_t)(s->wcap - 1));
-        s->wsize--;
-    }
-    s->w[s->wsize].idx = i;
-    s->w[s->wsize].score = score;
-    s->wsize++;
-
-    if (s->keep > 0) s->fc++;
-    int write_now = (s->fc % s->skip) == 0;
-    if (s->keep == 0) s->fc++;
-    if (!write_now) return;
-
+/* 关窗结算：窗口里分数最高的候选标记为胜者，分数 >= min_score 才进
+ * 最终输出列表；胜者缩略图成为下一次帧间差的基准。 */
+static void sel_close_window(Select *s) {
     int best = 0;
     for (int k = 1; k < s->wsize; k++)
         if (s->w[k].score > s->w[best].score) best = k;
@@ -401,7 +432,92 @@ static void sel_frame(Select *s, long long i, double score) {
         if (s->all[k].idx == s->w[best].idx) { s->chosen[k] = 1; break; }
     if (s->w[best].score >= s->min_score)
         push_cand(&s->win, &s->nwin, &s->capwin, s->w[best]);
+    memcpy(s->last_out, s->best_thumb, (size_t)s->thumb * s->thumb);
+    s->last_out_idx = s->w[best].idx;
     s->wsize = 0;
+}
+
+/* Port of FrameExtract.cpp's decode loop: candidate test, window push,
+ * and "write the sharpest of the window every `skip` source frames".
+ *
+ * 候选判定（keep>0）：((i+keep)%skip) < keep —— 把源帧按 skip 个一组
+ * 切开后，每组只有末尾 keep 帧是候选（例 skip=8、keep=4 → 候选是组内
+ * 第 4~7 帧）。keep==0 则退化为每组第 1 帧（i%skip==0）且不挑帧。
+ * 每攒满一组（fc 到达 skip 的倍数）就把窗口里分数最高的候选标记为
+ * 胜者；胜者分数 >= min_score 才进入最终输出列表。
+ *
+ * 动态间隔模式（sel_init 传 diff_th > 0）：候选 = 距上一张出图帧
+ * >= min_gap 的所有帧；帧间差（与上一张出图帧的 MAD）>= diff_th 或
+ * 窗长到达 max_gap 时关窗。帧 0 播种基准但不保证出图。分数在候选
+ * 判定之后才算（非候选帧的 laplacian 是白算的，两种模式都省掉）。 */
+static void sel_frame(Select *s, long long i, const uint8_t *thumb) {
+    size_t fsz = (size_t)s->thumb * s->thumb;
+
+    if (s->adaptive) {
+        if (s->last_out_idx < 0) {            /* 第一帧播种差值基准 */
+            memcpy(s->last_out, thumb, fsz);
+            s->last_out_idx = i;
+        }
+        if (i < s->last_out_idx + s->min_gap) return;  /* 离上张太近 */
+        double score = laplacian_var(thumb, s->thumb);
+        double d = frame_diff_mad(thumb, s->last_out, fsz);
+        if (s->wsize == 0) s->win_start = i;
+        push_cand(&s->all, &s->nall, &s->capall, (Cand){ i, score, d });
+        s->chosen = realloc(s->chosen, s->nall);
+        s->chosen[s->nall - 1] = 0;
+        s->w[s->wsize].idx = i;
+        s->w[s->wsize].score = score;
+        s->wsize++;
+        int is_best = 1;
+        for (int k = 0; k < s->wsize - 1; k++)
+            if (s->w[k].score >= score) { is_best = 0; break; }
+        if (is_best) memcpy(s->best_thumb, thumb, fsz);
+        if (d >= s->diff_th || i - s->win_start + 1 >= s->max_gap)
+            sel_close_window(s);
+        return;
+    }
+
+    int cand = s->keep > 0
+        ? (int)(((i + s->keep) % s->skip) < s->keep)
+        : (int)((i % s->skip) == 0);
+    if (!cand) { s->fc++; return; }
+
+    double score = laplacian_var(thumb, s->thumb);
+    if (s->last_out_idx < 0) {                /* 第一个候选播种差值基准 */
+        memcpy(s->last_out, thumb, fsz);
+        s->last_out_idx = i;
+    }
+    double d = frame_diff_mad(thumb, s->last_out, fsz);
+    push_cand(&s->all, &s->nall, &s->capall, (Cand){ i, score, d });
+    s->chosen = realloc(s->chosen, s->nall);
+    s->chosen[s->nall - 1] = 0;
+
+    if (s->wsize == s->wcap) {
+        /* 防御路径，正常不会到（每组候选数不会超过 wcap，见上注释）；
+         * 挤掉最旧候选后 best_thumb 可能指向已出窗的帧，但此路不触发 */
+        memmove(s->w, s->w + 1, sizeof(Cand) * (size_t)(s->wcap - 1));
+        s->wsize--;
+    }
+    s->w[s->wsize].idx = i;
+    s->w[s->wsize].score = score;
+    s->wsize++;
+    int is_best = 1;
+    for (int k = 0; k < s->wsize - 1; k++)
+        if (s->w[k].score >= score) { is_best = 0; break; }
+    if (is_best) memcpy(s->best_thumb, thumb, fsz);
+
+    if (s->keep > 0) s->fc++;
+    int write_now = (s->fc % s->skip) == 0;
+    if (s->keep == 0) s->fc++;
+    if (!write_now) return;
+
+    sel_close_window(s);
+}
+
+/* pass_a 结束时冲掉动态模式最后一个不完整窗口。固定模式保持老行为
+ * （尾部不满一组的候选不结算），保证输出数量与历史版本零漂移。 */
+static void sel_flush(Select *s) {
+    if (s->adaptive && s->wsize > 0) sel_close_window(s);
 }
 
 /* ------------------------------------------------------------ pass runners */
@@ -500,9 +616,10 @@ static long long pass_a(const Ctx *cx, int track, Select *sel) {
     long long i = 0;
     while (read_exact(ch.r, frame, fsz)) {
         if (cancelled()) break;
-        sel_frame(sel, i, laplacian_var(frame, cx->thumb));
+        sel_frame(sel, i, frame);
         if (++i % 250 == 0) STATUS(g_file_idx, 1, track, i);
     }
+    sel_flush(sel);
     free(frame);
     int rc = child_wait(&ch);
     if (cancelled()) return -2;
@@ -742,6 +859,7 @@ static wchar_t *make_mask_png(int w, int h, int pct, int track) {
 #define IDC_E_Q      1014
 #define IDC_E_OUT    1015
 #define IDC_E_MASK   1016
+#define IDC_E_DIFF   1017
 #define IDC_B_ADD    1021
 #define IDC_B_REM    1022
 #define IDC_B_CLEAR  1023
@@ -758,6 +876,7 @@ static wchar_t *make_mask_png(int w, int h, int pct, int track) {
 #define IDC_HINT_Q    1044
 #define IDC_HINT_MASK 1045
 #define IDC_HINT_OUT  1046
+#define IDC_HINT_DIFF 1047
 
 typedef struct { int idx, phase, track; long long a; } StatusMsg;
 typedef struct { int idx, rc; } DoneMsg;
@@ -770,7 +889,8 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
                                int *nattach);
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
-                         double min_score, int track, int thumb, int jpeg_q,
+                         double min_score, double diff_th, int min_gap,
+                         int max_gap, int track, int thumb, int jpeg_q,
                          int mask_pct, const wchar_t *hw_force, int file_idx);
 
 static HWND g_hwnd, g_list, g_log, g_pbar;
@@ -866,6 +986,18 @@ static DWORD WINAPI worker_proc(LPVOID param) {
         wchar_t buf[64];
         GetDlgItemTextW(g_hwnd, IDC_E_MIN, buf, 64);
         minscore = _wtof(buf);
+        if (minscore < 0.0) minscore = 0.0;
+    }
+    /* 变化阈值：>0 启用动态间隔（画面变化攒够才出图，间隔自动在
+     * 4~32 帧间伸缩）；0/留空 = 固定间隔模式。此模式下抽帧间隔/
+     * 锐度窗口被忽略。最小/最大出图间隔用编译期默认值（--min-gap/
+     * --max-gap 仅命令行可调）。 */
+    double diffth = 0.0;
+    {
+        wchar_t buf[64];
+        GetDlgItemTextW(g_hwnd, IDC_E_DIFF, buf, 64);
+        diffth = _wtof(buf);
+        if (diffth < 0.0) diffth = 0.0;
     }
 
     wchar_t *ffmpeg = find_ffmpeg(NULL);
@@ -886,6 +1018,7 @@ static DWORD WINAPI worker_proc(LPVOID param) {
             _snwprintf(outdir, n, L"%ls\\%ls", outbase, stem);
         }
         int rc = process_input(ffmpeg, g_paths[i], outdir, skip, keep, minscore,
+                               diffth, DEF_ADAPT_MIN_GAP, DEF_ADAPT_MAX_GAP,
                                -1, DEF_THUMB, q, maskpct, NULL, i);
         free(outdir);
         gui_fdone(NULL, i, rc);
@@ -926,6 +1059,7 @@ static void layout(HWND wnd) {
     int x = 10, y = 10;
     MoveWindow(GetDlgItem(wnd, IDC_E_SKIP), x + 62, y, 36, 23, TRUE); x += 110;
     MoveWindow(GetDlgItem(wnd, IDC_E_KEEP), x + 62, y, 36, 23, TRUE); x += 110;
+    MoveWindow(GetDlgItem(wnd, IDC_E_DIFF), x + 62, y, 34, 23, TRUE); x += 92;
     MoveWindow(GetDlgItem(wnd, IDC_E_MIN), x + 70, y, 44, 23, TRUE); x += 126;
     MoveWindow(GetDlgItem(wnd, IDC_E_Q), x + 64, y, 30, 23, TRUE); x += 92;
     MoveWindow(GetDlgItem(wnd, IDC_E_MASK), x + 44, y, 40, 23, TRUE); x += 92;
@@ -1658,19 +1792,22 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   L"Microsoft YaHei UI");
         add_label(wnd, L"抽帧间隔", 10, 58);
         add_label(wnd, L"锐度窗口", 120, 58);
-        add_label(wnd, L"最低清晰度", 230, 66);
-        add_label(wnd, L"JPEG质量", 356, 60);
-        add_label(wnd, L"涂黑%", 448, 40);
-        add_label(wnd, L"输出目录", 540, 60);
+        add_label(wnd, L"变化阈值", 230, 58);
+        add_label(wnd, L"最低清晰度", 322, 66);
+        add_label(wnd, L"JPEG质量", 448, 60);
+        add_label(wnd, L"涂黑%", 540, 40);
+        add_label(wnd, L"输出目录", 632, 60);
         add_hint(wnd, L"每N帧出1张\n（≈帧率÷N）", 10, 108, IDC_HINT_SKIP);
         add_hint(wnd, L"组末N帧挑最清晰\n留空=间隔÷2\n0=不挑", 120, 108, IDC_HINT_KEEP);
+        add_hint(wnd, L"画面变了才出图\n0=固定间隔\n8≈默认密度", 230, 88, IDC_HINT_DIFF);
         add_hint(wnd, L"胜者分数低于此值丢弃\n0=不过滤；阈值参考\n旁 sharpness_cam0.csv",
-                 230, 124, IDC_HINT_MIN);
-        add_hint(wnd, L"越小越清晰\n2≈高质量", 356, 90, IDC_HINT_Q);
-        add_hint(wnd, L"抽帧时圆外涂黑(黑边+模糊环)\n越小切越多\n0=不涂黑", 448, 86, IDC_HINT_MASK);
-        add_hint(wnd, L"留空=输出到各视频旁\n<视频名>_sharp\\", 540, 260, IDC_HINT_OUT);
+                 322, 124, IDC_HINT_MIN);
+        add_hint(wnd, L"越小越清晰\n2≈高质量", 448, 90, IDC_HINT_Q);
+        add_hint(wnd, L"抽帧时圆外涂黑(黑边+模糊环)\n越小切越多；仅双目OSV\n0=不涂黑", 540, 86, IDC_HINT_MASK);
+        add_hint(wnd, L"留空=输出到各视频旁\n<视频名>_sharp\\", 632, 260, IDC_HINT_OUT);
         make_ctl(wnd, L"EDIT", L"8", WS_BORDER | ES_AUTOHSCROLL, IDC_E_SKIP);
         make_ctl(wnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_E_KEEP);
+        make_ctl(wnd, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, IDC_E_DIFF);
         make_ctl(wnd, L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MIN);
         make_ctl(wnd, L"EDIT", L"2", WS_BORDER | ES_AUTOHSCROLL, IDC_E_Q);
         make_ctl(wnd, L"EDIT", L"95", WS_BORDER | ES_AUTOHSCROLL, IDC_E_MASK);
@@ -1743,15 +1880,29 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_B_TEST: start_mask_test(); break;
         case IDC_B_HELP:
             MessageBoxW(wnd,
-                L"三个核心参数的关系：视频按\u201c抽帧间隔\u201d分组，每组末尾\u201c锐度窗口\u201d\n"
-                L"帧里挑最清晰的一张出图；胜者分数低于\u201c最低清晰度\u201d则整组丢弃。\n\n"
+                L"两种选帧模式：默认按\u201c抽帧间隔\u201d分组，每组末尾\u201c锐度窗口\u201d\n"
+                L"帧里挑最清晰的一张出图，胜者分数低于\u201c最低清晰度\u201d则整组\n"
+                L"丢弃；把\u201c变化阈值\u201d填成大于 0 的数即切换为动态间隔模式。\n\n"
                 L"【抽帧间隔】（默认 8）\n"
                 L"每 N 个源帧输出 1 张，出图密度 ≈ 帧率÷N（25fps、N=8 → 约3张/秒）。\n"
-                L"想更密调小、更稀调大，与清晰度无关。\n\n"
+                L"想更密调小、更稀调大，与清晰度无关。\n"
+                L"动态间隔模式下此参数不参与。\n\n"
                 L"【锐度窗口】（留空 = 间隔÷2，填 0 = 不挑）\n"
                 L"每组只有末尾 N 帧参与评分，输出其中分数最高的一张。\n"
                 L"窗口越大出图越清晰，但时间戳抖动越大（最多偏 N-1 帧）。\n"
-                L"建议范围 1~间隔；窗口=间隔时全组参评；填 0 固定取每组第 1 帧。\n\n"
+                L"建议范围 1~间隔；窗口=间隔时全组参评；填 0 固定取每组第 1 帧。\n"
+                L"动态间隔模式下此参数不参与。\n\n"
+                L"【变化阈值】（默认 0 = 固定间隔；填大于 0 的数启用动态间隔）\n"
+                L"每帧与上一张出图帧比较平均灰度差（MAD），变化攒够阈值才\n"
+                L"结算出图，期间仍挑最清晰的一张，最低清晰度照常过滤。\n"
+                L"变化快\u2192出图密，静止\u2192自动变稀，相邻照片的画面变化量大致\n"
+                L"恒定，给 SfM 建模喂图最合适。间隔自动在 4~32 帧间伸缩\n"
+                L"（25fps \u2248 每秒 0.8~6 张），此模式下\u201c抽帧间隔/锐度窗口\u201d\n"
+                L"被忽略。\n"
+                L"定值方法：先用 0 跑一遍，看输出目录旁 sharpness_camN.csv 的\n"
+                L"diff 列——静止段数值小、走动段数值大，把阈值定在两者之间；\n"
+                L"调大出图更稀，调小更密。实测 8K 行走素材：8 \u2248 默认密度\n"
+                L"（约 3 张/秒），12 约减半，常用 5~12。\n\n"
                 L"【最低清晰度】（默认 0 = 不过滤）\n"
                 L"清晰度分 = 缩略图上拉普拉斯响应的方差：边缘细节多分数高，\n"
                 L"运动模糊/失焦分数低。用于丢掉模糊照片。\n"
@@ -1760,13 +1911,14 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"与清晰段之间，通常先试 min~avg 之间的值，再按丢弃比例微调。\n"
                 L"注意：数值与评分缩略图尺寸(-b)和场景内容相关，改参数要重标。\n\n"
                 L"【JPEG质量】（默认 2）ffmpeg -q:v，越小越清晰，2 接近视觉无损。\n\n"
-                L"【涂黑%】（默认 95，0 = 不涂黑）\n"
+                L"【涂黑%】（默认 95，0 = 不涂黑；仅双目 OSV 文件生效）\n"
                 L"抽帧编码时同步把每张图中心圆外的像素涂黑：圆心=画面\n"
                 L"中心，保留半径 = 百分数×短边÷2。用于切掉鱼眼黑边和紧\n"
                 L"贴黑边的失焦模糊环；涂黑区不产生图像梯度，SfM 特征点\n"
                 L"天然落不进去，等价于给建模链喂 mask。\n"
                 L"数字越小切得越多，保留面积 ≈ 百分数的平方\n"
-                L"（95%→90%，88%→77%）。\n"
+                L"（95%→90%，88%→77%）。普通单流视频（普通 mp4 等）\n"
+                L"没有鱼眼圆外黑边，自动跳过涂黑。\n"
                 L"参考：DJI Osmo 360 样帧实测清晰边界约 93%，默认 95 是\n"
                 L"用户在对比图上选定的值；拿不准就点「涂黑测试」看对比\n"
                 L"图再定。涂黑并入编码滤镜，几乎不增加耗时，无二次损失。\n\n"
@@ -1841,7 +1993,7 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* 参数提示小字显示为灰色，与正常标签区分 */
         {
             int id = GetDlgCtrlID((HWND)lp);
-            if (id >= IDC_HINT_SKIP && id <= IDC_HINT_OUT) {
+            if (id >= IDC_HINT_SKIP && id <= IDC_HINT_DIFF) {
                 static HBRUSH br = NULL;
                 if (!br) br = GetSysColorBrush(COLOR_WINDOW);
                 SetTextColor((HDC)wp, RGB(96, 96, 96));
@@ -1904,12 +2056,23 @@ static void usage(void) {
         "  -m, --min-score <f>  最低清晰度：胜者分数（拉普拉斯方差）低于\n"
         "                       此值则该组放弃出图（默认 0 = 不过滤；参考\n"
         "                       输出目录 sharpness_camN.csv 的分数分布定值）\n"
+        "      --diff <f>        变化阈值：>0 启用动态间隔——当前帧与上一张\n"
+        "                       出图帧的平均灰度差（MAD）>= f 才结算出图，\n"
+        "                       窗内仍挑最清晰一张；变化快出图密、静止自动\n"
+        "                       变稀（此模式下 -s/-k 被忽略）。实测 8K 行走\n"
+        "                       素材 8 \u2248 默认密度、12 约减半，常用 5~12；\n"
+        "                       定值参考 csv 的 diff 列分布\n"
+        "      --min-gap <n>     动态模式最小出图间隔帧数（默认 4，\n"
+        "                       25fps ≈ 最多 6 张/秒）\n"
+        "      --max-gap <n>     动态模式最大出图间隔帧数，静止段兜底\n"
+        "                       （默认 32）\n"
         "  -t, --track <n>      video track 0/1 (default: both)\n"
         "  -q, --jpeg-q <n>     JPEG质量，ffmpeg -q:v，越小越清晰（默认 2）\n"
         "  -b, --thumb <n>      评分缩略图边长，只影响打分与分数刻度（默认 512）\n"
         "      -mask <n>        边缘涂黑：抽帧编码时把每张图中心圆外涂黑，\n"
         "                       保留半径=n%%×短边÷2，越小切得越多\n"
-        "                       （默认 95；0 = 不涂黑）\n"
+        "                       （默认 95；0 = 不涂黑；仅双目 OSV 生效，\n"
+        "                       普通单流视频自动跳过）\n"
         "  -o, --out <dir>      output directory (default: <video>_sharp)\n"
         "      --ffmpeg <path>  ffmpeg executable\n"
         "      --hwaccel <name> force cuda/vulkan/d3d11va/none\n"
@@ -2029,17 +2192,51 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
     return parsed ? n : -1;
 }
 
+/* pass B 前清掉输出目录里上次运行留下的旧帧 jpg，防止换参数重跑
+ * （输出变少）或上次中断时新旧帧混在一起。只删“纯数字帧号.jpg”
+ * （本工具的命名格式），目录里用户自己的其他文件一律不动。 */
+static int clean_stale_jpg(const wchar_t *dir) {
+    wchar_t pat[MAX_PATH * 2];
+    _snwprintf(pat, MAX_PATH * 2, L"%ls\\*.jpg", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const wchar_t *s = fd.cFileName;
+        const wchar_t *dot = wcsrchr(s, L'.');
+        if (!dot || dot == s || wcscmp(dot, L".jpg") != 0) continue;
+        int alldigit = 1;
+        for (const wchar_t *p = s; p < dot; p++)
+            if (*p < L'0' || *p > L'9') { alldigit = 0; break; }
+        if (!alldigit) continue;
+        wchar_t full[MAX_PATH * 2];
+        _snwprintf(full, MAX_PATH * 2, L"%ls\\%ls", dir, s);
+        if (_wremove(full) == 0) n++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
 /* process one input end-to-end; 0 ok, 1 failed, 2 cancelled */
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
-                         double min_score, int track, int thumb, int jpeg_q,
+                         double min_score, double diff_th, int min_gap,
+                         int max_gap, int track, int thumb, int jpeg_q,
                          int mask_pct, const wchar_t *hw_force, int file_idx) {
     g_file_idx = file_idx;
     Ctx cx = { ffmpeg, input, L"", thumb, jpeg_q, 0, 0 };
     {
         char *i8 = w_to_utf8(input), *o8 = w_to_utf8(outdir);
-        LOG("=== %s ===\n  outdir: %s\n  skip=%d keep=%d min_score=%.1f q=%d mask=%d%%\n",
-            i8, o8, skip, keep, min_score, jpeg_q, mask_pct);
+        if (diff_th > 0.0)
+            LOG("=== %s ===\n  outdir: %s\n  mode: dynamic diff=%.1f gap=%d~%d"
+                " min_score=%.1f q=%d mask=%d%%\n",
+                i8, o8, diff_th, min_gap, max_gap, min_score, jpeg_q, mask_pct);
+        else
+            LOG("=== %s ===\n  outdir: %s\n  skip=%d keep=%d min_score=%.1f"
+                " q=%d mask=%d%%\n",
+                i8, o8, skip, keep, min_score, jpeg_q, mask_pct);
         free(i8); free(o8);
     }
     mkdirs_w(outdir);
@@ -2064,6 +2261,10 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                     nreal, nattach);
         }
     }
+    /* 双目判定以探测到的真实流数为准（-t 挑单轨后 ntracks 变 1，
+     * 但文件仍是鱼眼双目，涂黑照常）；单流普通视频没有鱼眼圆外
+     * 黑边，涂黑几何不适用，自动跳过。 */
+    int dual = ntracks > 1;
     if (track >= 0) {
         if (track < ntracks) {
             tracks[0] = tracks[track]; tw[0] = tw[track]; th[0] = th[track];
@@ -2114,39 +2315,56 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         LOG("[track %d] pass A: scoring frames...\n", ti);
 
         Select sel;
-        sel_init(&sel, skip, keep, min_score);
+        sel_init(&sel, skip, keep, min_score, diff_th, min_gap, max_gap, thumb);
         long long decoded = pass_a(&cx, tr, &sel);
-        if (decoded == -2) { rc = 2; free(dir); if (hw) free(hw); break; }
-        if (decoded < 0) { rc = 1; free(dir); if (hw) free(hw); break; }
+        if (decoded == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
+        if (decoded < 0) { rc = 1; sel_free(&sel); free(dir); if (hw) free(hw); break; }
 
         double mn = 1e30, mx = -1e30, sum = 0;
+        double dmn = 1e30, dmx = -1e30, dsum = 0;
         for (size_t k = 0; k < sel.nall; k++) {
             double v = sel.all[k].score;
             if (v < mn) mn = v;
             if (v > mx) mx = v;
             sum += v;
+            double dv = sel.all[k].diff;
+            if (dv < dmn) dmn = dv;
+            if (dv > dmx) dmx = dv;
+            dsum += dv;
         }
         double avg = sel.nall ? sum / (double)sel.nall : 0.0;
-        if (!sel.nall) { mn = avg = mx = 0.0; }   /* empty csv: don't print ±1e30 */
+        double davg = sel.nall ? dsum / (double)sel.nall : 0.0;
+        if (!sel.nall) { mn = avg = mx = 0.0; dmn = davg = dmx = 0.0; }
         LOG("[track %d] decoded %lld frames, %zu candidates, %zu winners\n"
-            "          score min=%.1f avg=%.1f max=%.1f\n",
-            ti, decoded, sel.nall, sel.nwin, mn, avg, mx);
+            "          score min=%.1f avg=%.1f max=%.1f\n"
+            "          diff  min=%.1f avg=%.1f max=%.1f%s\n",
+            ti, decoded, sel.nall, sel.nwin, mn, avg, mx, dmn, davg, dmx,
+            diff_th > 0.0 ? "  (dynamic: diff vs last winner)" : "");
 
         wchar_t csvp[MAX_PATH * 2];
         _snwprintf(csvp, MAX_PATH * 2, L"%ls\\sharpness_cam%d.csv", outdir, ti);
         FILE *csv = _wfopen(csvp, L"wb");
         if (csv) {
-            fprintf(csv, "frame,score,chosen\n");
+            fprintf(csv, "frame,score,diff,chosen\n");
             for (size_t k = 0; k < sel.nall; k++)
-                fprintf(csv, "%lld,%.1f,%d\n", sel.all[k].idx, sel.all[k].score,
-                        sel.chosen[k]);
+                fprintf(csv, "%lld,%.1f,%.1f,%d\n", sel.all[k].idx,
+                        sel.all[k].score, sel.all[k].diff, sel.chosen[k]);
             fclose(csv);
         }
 
         mkdirs_w(dir);
+        {
+            int cleaned = clean_stale_jpg(dir);
+            if (cleaned)
+                LOG("[track %d] cleaned %d stale jpg(s) left by a previous run\n",
+                    ti, cleaned);
+        }
         STATUS(file_idx, 3, ti, (long long)sel.nwin);
         wchar_t *maskp = NULL;
-        if (mask_pct > 0 && cx.vw > 0 && cx.vh > 0) {
+        if (mask_pct > 0 && !dual) {
+            LOG("[track %d] pass B: writing %zu jpegs (edge mask skipped: single-stream video)...\n",
+                ti, sel.nwin);
+        } else if (mask_pct > 0 && cx.vw > 0 && cx.vh > 0) {
             maskp = make_mask_png(cx.vw, cx.vh, mask_pct, ti);
             if (maskp)
                 LOG("[track %d] pass B: writing %zu jpegs (edge mask %d%%, in-filter single encode)...\n",
@@ -2162,10 +2380,10 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         }
         int pb = pass_b(&cx, tr, sel.win, sel.nwin, dir, maskp);
         if (maskp) { _wunlink(maskp); free(maskp); }
-        if (pb == -2) { rc = 2; free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir); if (hw) free(hw); break; }
+        if (pb == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
 
-        free(sel.win); free(sel.all); free(sel.chosen); free(sel.w); free(dir);
+        sel_free(&sel); free(dir);
         if (hw) free(hw);
     }
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
@@ -2204,7 +2422,8 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *outdir_arg = NULL, *ffmpeg_arg = NULL, *hw_force = NULL;
     int skip = DEF_SKIP, keep = -1, track = -1, thumb = DEF_THUMB, jpeg_q = DEF_JPEG_Q;
     int mask_pct = DEF_MASK;
-    double min_score = 0.0;
+    double min_score = 0.0, diff_th = 0.0;
+    int min_gap = DEF_ADAPT_MIN_GAP, max_gap = DEF_ADAPT_MAX_GAP;
     int nopause = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -2213,6 +2432,9 @@ int wmain(int argc, wchar_t **argv) {
         else if (!wcscmp(a, L"-s") || !wcscmp(a, L"--skip")) skip = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-k") || !wcscmp(a, L"--keep")) keep = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-m") || !wcscmp(a, L"--min-score")) min_score = _wtof(argv[++i]);
+        else if (!wcscmp(a, L"--diff")) diff_th = _wtof(argv[++i]);
+        else if (!wcscmp(a, L"--min-gap")) min_gap = _wtoi(argv[++i]);
+        else if (!wcscmp(a, L"--max-gap")) max_gap = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-t") || !wcscmp(a, L"--track")) track = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-q") || !wcscmp(a, L"--jpeg-q")) jpeg_q = _wtoi(argv[++i]);
         else if (!wcscmp(a, L"-b") || !wcscmp(a, L"--thumb")) thumb = _wtoi(argv[++i]);
@@ -2228,6 +2450,9 @@ int wmain(int argc, wchar_t **argv) {
     if (keep < 0) keep = (int)(0.5 * skip + 0.5);
     if (thumb < 32) thumb = 32;
     if (mask_pct < 0 || mask_pct > 100) mask_pct = DEF_MASK;
+    if (diff_th < 0.0) diff_th = 0.0;
+    if (min_gap < 1) min_gap = 1;
+    if (max_gap < min_gap) max_gap = min_gap;
 
     wchar_t *ffmpeg = find_ffmpeg(ffmpeg_arg);
 
@@ -2270,6 +2495,7 @@ int wmain(int argc, wchar_t **argv) {
             _snwprintf(outdir, n, L"%ls\\%ls_sharp", dir, stem);
         }
         if (process_input(ffmpeg, inputs[i], outdir, skip, keep, min_score,
+                          diff_th, min_gap, max_gap,
                           track, thumb, jpeg_q, mask_pct, hw_force, i) != 0)
             failed++;
         free(outdir);
