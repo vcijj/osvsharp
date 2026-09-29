@@ -81,6 +81,8 @@
  *   动态间隔（“变化阈值”>0 启用）：每帧与上一张出图帧算平均灰度差，
  *     变化攒够阈值才结算出图（窗内仍挑最清晰，仍受最低清晰度过滤）；
  *     变化快→出图密、静止→自动变稀，间隔在 min_gap~max_gap 帧间伸缩。
+ * 双目文件两轨共用轨0 上测得的布点：cam0/cam1 输出帧号严格一致、
+ * 逐号配对；轨1 跳过评分，也不生成 cam1 的 csv。
  *
  * ┌────────────┬──────┬────────────┬────────────────────────────────┐
  * │ 界面标签    │ 参数  │ 默认        │ 作用                           │
@@ -1882,7 +1884,9 @@ static LRESULT CALLBACK wndproc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             MessageBoxW(wnd,
                 L"两种选帧模式：默认按\u201c抽帧间隔\u201d分组，每组末尾\u201c锐度窗口\u201d\n"
                 L"帧里挑最清晰的一张出图，胜者分数低于\u201c最低清晰度\u201d则整组\n"
-                L"丢弃；把\u201c变化阈值\u201d填成大于 0 的数即切换为动态间隔模式。\n\n"
+                L"丢弃；把\u201c变化阈值\u201d填成大于 0 的数即切换为动态间隔模式。\n"
+                L"双目文件两轨共用 cam0 测得的选帧布点：cam0/cam1 输出帧号\n"
+                L"严格一致、逐号配对（轨1 跳过评分，不生成 cam1 的 csv）。\n\n"
                 L"【抽帧间隔】（默认 8）\n"
                 L"每 N 个源帧输出 1 张，出图密度 ≈ 帧率÷N（25fps、N=8 → 约3张/秒）。\n"
                 L"想更密调小、更稀调大，与清晰度无关。\n"
@@ -2049,7 +2053,10 @@ static void usage(void) {
         "usage: osvsharp <video1> [video2 ...] [options]\n"
         "  Drag & drop video files onto osvsharp.exe works: output goes to\n"
         "  <video dir>/<video name>_sharp (cam0/cam1 subdirs for two-stream\n"
-        "  files like .OSV; attached-pic cover streams are ignored).\n\n"
+        "  files like .OSV; attached-pic cover streams are ignored).\n"
+        "  Two-stream files share one extraction plan measured on track 0:\n"
+        "  cam0/cam1 output identical frame numbers (exact stereo pairing);\n"
+        "  only cam0 gets a sharpness CSV.\n\n"
         "  -s, --skip <n>       抽帧间隔：每 n 个源帧输出 1 张（默认 8）\n"
         "  -k, --keep <n>       锐度窗口：每组末尾 n 帧里挑最清晰的一张\n"
         "                       （默认 skip/2；0 = 不挑，固定取每组第 1 帧）\n"
@@ -2060,7 +2067,7 @@ static void usage(void) {
         "                       出图帧的平均灰度差（MAD）>= f 才结算出图，\n"
         "                       窗内仍挑最清晰一张；变化快出图密、静止自动\n"
         "                       变稀（此模式下 -s/-k 被忽略）。实测 8K 行走\n"
-        "                       素材 8 \u2248 默认密度、12 约减半，常用 5~12；\n"
+        "                       素材 8 ≈ 默认密度、12 约减半，常用 5~12；\n"
         "                       定值参考 csv 的 diff 列分布\n"
         "      --min-gap <n>     动态模式最小出图间隔帧数（默认 4，\n"
         "                       25fps ≈ 最多 6 张/秒）\n"
@@ -2278,6 +2285,12 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
 
     ULONGLONG t0 = GetTickCount64();
     int rc = 0;
+    /* 双轨：rig 两路看到的是同一场运动，选帧布点只在轨0 测量、两轨
+     * 共享——cam0/cam1 输出相同帧号才能逐号配对（同号即同一时刻）。
+     * 轨1 跳过评分，还省一遍解码；固定/动态两种模式都如此。 */
+    Cand *plan = NULL;
+    size_t nplan = 0;
+    int shared = 0;
     for (int ti = 0; ti < ntracks && rc == 0; ti++) {
         int tr = tracks[ti];
         cx.vw = tw[ti]; cx.vh = th[ti];
@@ -2312,44 +2325,59 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                 hw_force ? " (forced)" : "");
             free(h8);
         }
-        LOG("[track %d] pass A: scoring frames...\n", ti);
-
-        Select sel;
-        sel_init(&sel, skip, keep, min_score, diff_th, min_gap, max_gap, thumb);
-        long long decoded = pass_a(&cx, tr, &sel);
-        if (decoded == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
-        if (decoded < 0) { rc = 1; sel_free(&sel); free(dir); if (hw) free(hw); break; }
-
-        double mn = 1e30, mx = -1e30, sum = 0;
-        double dmn = 1e30, dmx = -1e30, dsum = 0;
-        for (size_t k = 0; k < sel.nall; k++) {
-            double v = sel.all[k].score;
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-            sum += v;
-            double dv = sel.all[k].diff;
-            if (dv < dmn) dmn = dv;
-            if (dv > dmx) dmx = dv;
-            dsum += dv;
+        Select sel = {0};
+        long long decoded = 0;
+        if (shared) {
+            LOG("[track %d] pass A skipped: reusing track 0's extraction plan"
+                " (%zu frames, stays paired with cam0)\n", ti, nplan);
+        } else {
+            LOG("[track %d] pass A: scoring frames...\n", ti);
+            sel_init(&sel, skip, keep, min_score, diff_th, min_gap, max_gap, thumb);
+            decoded = pass_a(&cx, tr, &sel);
+            if (decoded == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
+            if (decoded < 0) { rc = 1; sel_free(&sel); free(dir); if (hw) free(hw); break; }
         }
-        double avg = sel.nall ? sum / (double)sel.nall : 0.0;
-        double davg = sel.nall ? dsum / (double)sel.nall : 0.0;
-        if (!sel.nall) { mn = avg = mx = 0.0; dmn = davg = dmx = 0.0; }
-        LOG("[track %d] decoded %lld frames, %zu candidates, %zu winners\n"
-            "          score min=%.1f avg=%.1f max=%.1f\n"
-            "          diff  min=%.1f avg=%.1f max=%.1f%s\n",
-            ti, decoded, sel.nall, sel.nwin, mn, avg, mx, dmn, davg, dmx,
-            diff_th > 0.0 ? "  (dynamic: diff vs last winner)" : "");
 
-        wchar_t csvp[MAX_PATH * 2];
-        _snwprintf(csvp, MAX_PATH * 2, L"%ls\\sharpness_cam%d.csv", outdir, ti);
-        FILE *csv = _wfopen(csvp, L"wb");
-        if (csv) {
-            fprintf(csv, "frame,score,diff,chosen\n");
-            for (size_t k = 0; k < sel.nall; k++)
-                fprintf(csv, "%lld,%.1f,%.1f,%d\n", sel.all[k].idx,
-                        sel.all[k].score, sel.all[k].diff, sel.chosen[k]);
-            fclose(csv);
+        if (!shared) {
+            double mn = 1e30, mx = -1e30, sum = 0;
+            double dmn = 1e30, dmx = -1e30, dsum = 0;
+            for (size_t k = 0; k < sel.nall; k++) {
+                double v = sel.all[k].score;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v;
+                double dv = sel.all[k].diff;
+                if (dv < dmn) dmn = dv;
+                if (dv > dmx) dmx = dv;
+                dsum += dv;
+            }
+            double avg = sel.nall ? sum / (double)sel.nall : 0.0;
+            double davg = sel.nall ? dsum / (double)sel.nall : 0.0;
+            if (!sel.nall) { mn = avg = mx = 0.0; dmn = davg = dmx = 0.0; }
+            LOG("[track %d] decoded %lld frames, %zu candidates, %zu winners\n"
+                "          score min=%.1f avg=%.1f max=%.1f\n"
+                "          diff  min=%.1f avg=%.1f max=%.1f%s\n",
+                ti, decoded, sel.nall, sel.nwin, mn, avg, mx, dmn, davg, dmx,
+                diff_th > 0.0 ? "  (dynamic: diff vs last winner)" : "");
+
+            wchar_t csvp[MAX_PATH * 2];
+            _snwprintf(csvp, MAX_PATH * 2, L"%ls\\sharpness_cam%d.csv", outdir, ti);
+            FILE *csv = _wfopen(csvp, L"wb");
+            if (csv) {
+                fprintf(csv, "frame,score,diff,chosen\n");
+                for (size_t k = 0; k < sel.nall; k++)
+                    fprintf(csv, "%lld,%.1f,%.1f,%d\n", sel.all[k].idx,
+                            sel.all[k].score, sel.all[k].diff, sel.chosen[k]);
+                fclose(csv);
+            }
+            /* 双轨：把轨0 的胜者表移出 sel 作为共享布点（轨1 直接用）*/
+            if (ntracks > 1) {
+                plan = sel.win;
+                nplan = sel.nwin;
+                sel.win = NULL;
+                sel.nwin = sel.capwin = 0;
+                shared = 1;
+            }
         }
 
         mkdirs_w(dir);
@@ -2359,26 +2387,28 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                 LOG("[track %d] cleaned %d stale jpg(s) left by a previous run\n",
                     ti, cleaned);
         }
-        STATUS(file_idx, 3, ti, (long long)sel.nwin);
+        Cand *wlist = shared ? plan : sel.win;
+        size_t nw = shared ? nplan : sel.nwin;
+        STATUS(file_idx, 3, ti, (long long)nw);
         wchar_t *maskp = NULL;
         if (mask_pct > 0 && !dual) {
             LOG("[track %d] pass B: writing %zu jpegs (edge mask skipped: single-stream video)...\n",
-                ti, sel.nwin);
+                ti, nw);
         } else if (mask_pct > 0 && cx.vw > 0 && cx.vh > 0) {
             maskp = make_mask_png(cx.vw, cx.vh, mask_pct, ti);
             if (maskp)
                 LOG("[track %d] pass B: writing %zu jpegs (edge mask %d%%, in-filter single encode)...\n",
-                    ti, sel.nwin, mask_pct);
+                    ti, nw, mask_pct);
             else
                 LOG("[track %d] pass B: writing %zu jpegs (edge mask: cannot write temp png, skipped)...\n",
-                    ti, sel.nwin);
+                    ti, nw);
         } else if (mask_pct > 0) {
             LOG("[track %d] pass B: writing %zu jpegs (edge mask skipped: resolution unknown)...\n",
-                ti, sel.nwin);
+                ti, nw);
         } else {
-            LOG("[track %d] pass B: writing %zu jpegs...\n", ti, sel.nwin);
+            LOG("[track %d] pass B: writing %zu jpegs...\n", ti, nw);
         }
-        int pb = pass_b(&cx, tr, sel.win, sel.nwin, dir, maskp);
+        int pb = pass_b(&cx, tr, wlist, nw, dir, maskp);
         if (maskp) { _wunlink(maskp); free(maskp); }
         if (pb == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
@@ -2386,6 +2416,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         sel_free(&sel); free(dir);
         if (hw) free(hw);
     }
+    free(plan);
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
     return rc;
 }
