@@ -640,6 +640,370 @@ static long long pass_a(const Ctx *cx, int track, Select *sel) {
     return i;
 }
 
+/* ------------------------------------------------- OSV 内部 djmd → POS */
+/* djmd 元数据轨是 protobuf（dvtm_AVATA360.proto），逐帧一条，与视频帧
+ * 一一对应。字段位置（对 0002 号素材逆向实测，经 SRT 逐帧比对验证）：
+ *   3.4.4.1.2/.3  latitude / longitude   (fixed64 double)
+ *   3.4.4.2       abs_alt                (varint, 毫米)
+ *   3.4.5.1       rel_alt                (fixed32, 毫米 float)
+ *   3.4.3.1/2/3   pitch / roll / yaw     (varint, 0.01 度, 有符号)
+ * djmd 轨的 hdlr 是 "meta"，真正标识在 stsd 的 fourcc；>4GB 文件的块
+ * 偏移在 co64 里。出图时优先用它（OSV 必有、含姿态角），无 djmd 才回
+ * 退到旁路 .SRT（只有位置）。 */
+
+typedef struct {
+    double lat, lon, rel_alt, abs_alt;
+    double pitch, roll, yaw;
+    int has_pos, has_att;
+} PosEntry;
+typedef struct { PosEntry *e; size_t n; } PosTable;
+
+static void pos_free(PosTable *pt) { free(pt->e); pt->e = NULL; pt->n = 0; }
+
+/* ---- minimal protobuf wire helpers ---- */
+typedef struct { int fn, wt; const unsigned char *p; size_t len; uint64_t num; } PbField;
+
+static int pb_next(const unsigned char *b, size_t n, size_t *i, PbField *f) {
+    if (*i >= n) return 0;
+    uint64_t key = 0; int sh = 0;
+    while (*i < n) {
+        unsigned char c = b[(*i)++];
+        key |= (uint64_t)(c & 0x7F) << sh;
+        if (!(c & 0x80)) break;
+        sh += 7;
+        if (sh > 42) return 0;
+    }
+    f->fn = (int)(key >> 3);
+    f->wt = (int)(key & 7);
+    f->p = NULL; f->len = 0; f->num = 0;
+    switch (f->wt) {
+    case 0:
+        while (*i < n) {
+            unsigned char c = b[(*i)++];
+            f->num |= (uint64_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) return 1;
+            sh += 7;
+        }
+        return 0;
+    case 1: if (*i + 8 > n) return 0; f->p = b + *i; f->len = 8; *i += 8; return 1;
+    case 2: {
+        uint64_t ln = 0; sh = 0;
+        while (*i < n) {
+            unsigned char c = b[(*i)++];
+            ln |= (uint64_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) break;
+            sh += 7;
+        }
+        if (*i + ln > n) return 0;
+        f->p = b + *i; f->len = (size_t)ln; *i += (size_t)ln;
+        return 1;
+    }
+    case 5: if (*i + 4 > n) return 0; f->p = b + *i; f->len = 4; *i += 4; return 1;
+    default: return 0;
+    }
+}
+
+/* 进入一层 field(fn, wt==2)，返回内容起点/长度；找不到返回 0 */
+static int pb_descend(const unsigned char *b, size_t n, int fn,
+                      const unsigned char **out, size_t *outn) {
+    size_t i = 0;
+    PbField f;
+    while (pb_next(b, n, &i, &f)) {
+        if (f.fn == fn && f.wt == 2) {
+            *out = f.p; *outn = f.len;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static double pb_f64(const unsigned char *p) {
+    uint64_t v = 0;
+    for (int k = 7; k >= 0; k--) v = (v << 8) | p[k];   /* little endian */
+    double d;
+    memcpy(&d, &v, 8);
+    return d;
+}
+
+static float pb_f32(const unsigned char *p) {
+    uint32_t v = 0;
+    for (int k = 3; k >= 0; k--) v = (v << 8) | p[k];
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+}
+
+static int64_t pb_s64(uint64_t v) { return (int64_t)v; }
+
+static void djmd_parse_sample(const unsigned char *b, size_t n, PosEntry *pe) {
+    memset(pe, 0, sizeof *pe);
+    const unsigned char *p1; size_t n1;
+    if (!pb_descend(b, n, 3, &p1, &n1)) return;
+    const unsigned char *nav; size_t navn;
+    if (!pb_descend(p1, n1, 4, &nav, &navn)) return;
+
+    /* GPS: 3.4.4.1.2/.3 doubles, 3.4.4.2 abs_alt mm */
+    const unsigned char *gps; size_t gpsn;
+    if (pb_descend(nav, navn, 4, &gps, &gpsn)) {
+        const unsigned char *ll; size_t lln;
+        if (pb_descend(gps, gpsn, 1, &ll, &lln)) {
+            size_t i = 0; PbField f;
+            while (pb_next(ll, lln, &i, &f)) {
+                if (f.wt == 1 && f.len == 8) {
+                    if (f.fn == 2) pe->lat = pb_f64(f.p);
+                    if (f.fn == 3) pe->lon = pb_f64(f.p);
+                }
+            }
+        }
+        {
+            size_t i2 = 0; PbField f2;
+            while (pb_next(gps, gpsn, &i2, &f2))
+                if (f2.fn == 2 && f2.wt == 0) pe->abs_alt = (double)pb_s64(f2.num) / 1000.0;
+        }
+    }
+    /* rel_alt: 3.4.5.1 fixed32 mm */
+    {
+        const unsigned char *rel; size_t reln;
+        if (pb_descend(nav, navn, 5, &rel, &reln)) {
+            size_t i = 0; PbField f;
+            while (pb_next(rel, reln, &i, &f))
+                if (f.fn == 1 && f.wt == 5)
+                    pe->rel_alt = pb_f32(f.p) / 1000.0;
+        }
+    }
+    /* euler: 3.4.3.1/2/3 varint 0.01deg */
+    {
+        const unsigned char *eu; size_t eun;
+        if (pb_descend(nav, navn, 3, &eu, &eun)) {
+            size_t i = 0; PbField f;
+            while (pb_next(eu, eun, &i, &f)) {
+                if (f.wt != 0) continue;
+                double v = (double)pb_s64(f.num) / 100.0;
+                if (f.fn == 1) pe->pitch = v;
+                if (f.fn == 2) pe->roll = v;
+                if (f.fn == 3) pe->yaw = v;
+            }
+        }
+    }
+    pe->has_pos = pe->lat != 0.0 || pe->lon != 0.0 || pe->abs_alt != 0.0;
+    pe->has_att = pe->pitch != 0.0 || pe->roll != 0.0 || pe->yaw != 0.0;
+    /* 逆向样本里四舍五入后三者可能全 0，放宽：欧拉块解析成功即算有 */
+    {
+        const unsigned char *eu; size_t eun;
+        if (pb_descend(nav, navn, 3, &eu, &eun)) pe->has_att = 1;
+    }
+}
+
+/* ---- minimal mp4 box walk（只找第一条 djmd 轨的样本表）---- */
+static int djmd_load(const wchar_t *path, PosTable *pt) {
+    pt->e = NULL; pt->n = 0;
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return -1;
+    _fseeki64(f, 0, SEEK_END);
+    int64_t fsz = _ftelli64(f);
+    rewind(f);
+
+    unsigned char hdr[8];
+    int64_t moov_s = -1, moov_e = -1, pos = 0;
+    while (pos + 8 <= fsz) {
+        _fseeki64(f, pos, SEEK_SET);
+        if (fread(hdr, 1, 8, f) != 8) break;
+        uint32_t sz32 = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                        ((uint32_t)hdr[2] << 8) | hdr[3];
+        int64_t sz = sz32, hlen = 8;
+        if (sz == 1) {
+            unsigned char ext[8];
+            if (fread(ext, 1, 8, f) != 8) break;
+            sz = 0;
+            for (int k = 0; k < 8; k++) sz = (sz << 8) | ext[k];
+            hlen = 16;
+        } else if (sz == 0) sz = fsz - pos;
+        if (memcmp(hdr + 4, "moov", 4) == 0) { moov_s = pos + hlen; moov_e = pos + sz; break; }
+        pos += sz;
+    }
+    if (moov_s < 0) { fclose(f); return -1; }
+
+    /* 遍历 trak，找 stsd fourcc == 'djmd' 的那条，记下它的 stbl 范围 */
+    int64_t stbl_s = -1, stbl_e = -1;
+    int64_t tp = moov_s;
+    while (tp + 8 <= moov_e && stbl_s < 0) {
+        _fseeki64(f, tp, SEEK_SET);
+        if (fread(hdr, 1, 8, f) != 8) break;
+        uint32_t sz32 = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                        ((uint32_t)hdr[2] << 8) | hdr[3];
+        int64_t sz = sz32, hlen = 8;
+        if (sz == 1) {
+            unsigned char ext[8];
+            if (fread(ext, 1, 8, f) != 8) break;
+            sz = 0;
+            for (int k = 0; k < 8; k++) sz = (sz << 8) | ext[k];
+            hlen = 16;
+        } else if (sz == 0) sz = moov_e - tp;
+        if (memcmp(hdr + 4, "trak", 4) == 0) {
+            /* 在 trak 内找 stbl（stsd 是 stbl 的子盒，编码 fourcc 要进
+             * stbl 里读第一个 stsd 条目） */
+            int64_t mp = tp + hlen, me = tp + sz;
+            unsigned char h2[8];
+            int64_t sb_s = -1, sb_e = -1;
+            while (mp + 8 <= me) {
+                _fseeki64(f, mp, SEEK_SET);
+                if (fread(h2, 1, 8, f) != 8) break;
+                uint32_t s2 = ((uint32_t)h2[0] << 24) | ((uint32_t)h2[1] << 16) |
+                              ((uint32_t)h2[2] << 8) | h2[3];
+                if (s2 == 0) s2 = (uint32_t)(me - mp);
+                if (memcmp(h2 + 4, "mdia", 4) == 0 || memcmp(h2 + 4, "minf", 4) == 0) {
+                    mp += 8; continue;
+                }
+                if (memcmp(h2 + 4, "stbl", 4) == 0 && sb_s < 0) {
+                    sb_s = mp + 8; sb_e = mp + s2;
+                }
+                mp += s2;
+            }
+            if (sb_s >= 0) {
+                /* stbl 的第一个子盒通常就是 stsd；读它的条目 fourcc */
+                unsigned char d[24];
+                _fseeki64(f, sb_s, SEEK_SET);
+                if (fread(d, 1, 24, f) == 24 && memcmp(d + 4, "stsd", 4) == 0 &&
+                    memcmp(d + 20, "djmd", 4) == 0) {
+                    stbl_s = sb_s; stbl_e = sb_e;
+                }
+            }
+        }
+        tp += sz;
+    }
+    if (stbl_s < 0) { fclose(f); return 0; }
+
+    /* 解析 stbl: stsz + stsc + stco/co64 */
+    uint32_t *szs = NULL; size_t nsz = 0;
+    uint64_t *offs = NULL; size_t noff = 0;
+    int64_t sp = stbl_s;
+    unsigned char h3[8];
+    uint32_t *stco = NULL; size_t nstco = 0;
+    struct { uint32_t first, per; } *stsc = NULL; size_t nstsc = 0;
+    while (sp + 8 <= stbl_e) {
+        _fseeki64(f, sp, SEEK_SET);
+        if (fread(h3, 1, 8, f) != 8) break;
+        uint32_t s3 = ((uint32_t)h3[0] << 24) | ((uint32_t)h3[1] << 16) |
+                      ((uint32_t)h3[2] << 8) | h3[3];
+        if (s3 == 0) s3 = (uint32_t)(stbl_e - sp);
+        unsigned char *d = malloc(s3 > 8 ? s3 - 8 : 0);
+        size_t dl = s3 > 8 ? (size_t)s3 - 8 : 0;
+        if (dl && fread(d, 1, dl, f) != dl) { free(d); break; }
+        if (!memcmp(h3 + 4, "stsz", 4) && dl >= 12) {
+            uint32_t ssz = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+                           ((uint32_t)d[6] << 8) | d[7];
+            nsz = ((uint32_t)d[8] << 24) | ((uint32_t)d[9] << 16) |
+                  ((uint32_t)d[10] << 8) | d[11];
+            szs = malloc(nsz * 4);
+            for (size_t k = 0; k < nsz; k++) {
+                if (ssz) szs[k] = ssz;
+                else if (12 + 4 * k + 4 <= dl)
+                    szs[k] = ((uint32_t)d[12 + 4 * k] << 24) | ((uint32_t)d[13 + 4 * k] << 16) |
+                             ((uint32_t)d[14 + 4 * k] << 8) | d[15 + 4 * k];
+                else szs[k] = 0;
+            }
+        } else if (!memcmp(h3 + 4, "stsc", 4) && dl >= 8) {
+            nstsc = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+                    ((uint32_t)d[6] << 8) | d[7];
+            stsc = malloc(nstsc * 8);
+            for (size_t k = 0; k < nstsc && 8 + 12 * k + 8 <= dl; k++) {
+                stsc[k].first = ((uint32_t)d[8 + 12 * k] << 24) | ((uint32_t)d[9 + 12 * k] << 16) |
+                                ((uint32_t)d[10 + 12 * k] << 8) | d[11 + 12 * k];
+                stsc[k].per = ((uint32_t)d[12 + 12 * k] << 24) | ((uint32_t)d[13 + 12 * k] << 16) |
+                              ((uint32_t)d[14 + 12 * k] << 8) | d[15 + 12 * k];
+            }
+        } else if (!memcmp(h3 + 4, "stco", 4) && dl >= 8) {
+            nstco = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+                    ((uint32_t)d[6] << 8) | d[7];
+            stco = malloc(nstco * 8);   /* 统一按 64 位存 */
+            for (size_t k = 0; k < nstco && 8 + 4 * k + 4 <= dl; k++)
+                stco[k] = ((uint32_t)d[8 + 4 * k] << 24) | ((uint32_t)d[9 + 4 * k] << 16) |
+                          ((uint32_t)d[10 + 4 * k] << 8) | d[11 + 4 * k];
+        } else if (!memcmp(h3 + 4, "co64", 4) && dl >= 8) {
+            nstco = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
+                    ((uint32_t)d[6] << 8) | d[7];
+            stco = malloc(nstco * 8);
+            for (size_t k = 0; k < nstco && 8 + 8 * k + 8 <= dl; k++) {
+                uint64_t v = 0;
+                for (int b = 0; b < 8; b++) v = (v << 8) | d[8 + 8 * k + b];
+                stco[k] = v;
+            }
+        }
+        free(d);
+        sp += s3;
+    }
+
+    if (!szs || !stco || !stsc || nsz == 0) {
+        free(szs); free(stco); free(stsc);
+        fclose(f);
+        return 0;
+    }
+    offs = malloc(nsz * 8);
+    size_t si = 0;
+    for (size_t k = 0; k < nstsc && si < nsz; k++) {
+        size_t nch = (k + 1 < nstsc) ? (size_t)(stsc[k + 1].first - stsc[k].first)
+                                     : (nstco - (stsc[k].first - 1));
+        for (size_t c = 0; c < nch && si < nsz; c++) {
+            uint64_t o = stco[stsc[k].first - 1 + c];
+            for (uint32_t r = 0; r < stsc[k].per && si < nsz; r++) {
+                offs[si++] = o;
+                o += szs[si - 1];
+            }
+        }
+    }
+    free(stco); free(stsc);
+
+    /* 逐样本读出并解析 */
+    pt->e = calloc(nsz, sizeof(PosEntry));
+    pt->n = nsz;
+    unsigned char *sbuf = NULL;
+    size_t scap = 0;
+    size_t ok = 0;
+    for (size_t k = 0; k < nsz; k++) {
+        if (szs[k] > scap) { scap = szs[k] * 2; sbuf = realloc(sbuf, scap); }
+        _fseeki64(f, (int64_t)offs[k], SEEK_SET);
+        if (szs[k] && fread(sbuf, 1, szs[k], f) == szs[k]) {
+            djmd_parse_sample(sbuf, szs[k], &pt->e[k]);
+            if (pt->e[k].has_pos) ok++;
+        }
+    }
+    free(sbuf); free(szs); free(offs);
+    fclose(f);
+    return (int)ok;
+}
+
+/* XMP drone-dji 段（姿态+高度，Metashape/大疆智图可读的官方格式） */
+static int xmp_dji_app1(const PosEntry *pe, unsigned char *o, int cap) {
+    char x[1400];
+    int xl = _snprintf(x, sizeof x,
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF "
+        "xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+        "<rdf:Description rdf:about=\"\" "
+        "xmlns:drone-dji=\"http://dji.com/drone-dji/\">"
+        "<drone-dji:AbsoluteAltitude>%.2f</drone-dji:AbsoluteAltitude>"
+        "<drone-dji:RelativeAltitude>%.2f</drone-dji:RelativeAltitude>"
+        "<drone-dji:GimbalRollDegree>%.2f</drone-dji:GimbalRollDegree>"
+        "<drone-dji:GimbalPitchDegree>%.2f</drone-dji:GimbalPitchDegree>"
+        "<drone-dji:GimbalYawDegree>%.2f</drone-dji:GimbalYawDegree>"
+        "<drone-dji:FlightRollDegree>%.2f</drone-dji:FlightRollDegree>"
+        "<drone-dji:FlightPitchDegree>%.2f</drone-dji:FlightPitchDegree>"
+        "<drone-dji:FlightYawDegree>%.2f</drone-dji:FlightYawDegree>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>",
+        pe->abs_alt, pe->rel_alt, pe->roll, pe->pitch, pe->yaw,
+        pe->roll, pe->pitch, pe->yaw);
+    static const char ns[] = "http://ns.adobe.com/xap/1.0/";
+    int total = 2 + 2 + (int)sizeof ns + xl;
+    if (total + 2 > cap) return 0;
+    int len = (int)sizeof ns + xl;          /* APP1 段长（含长度字段自身） */
+    o[0] = 0xFF; o[1] = 0xE1;
+    o[2] = (unsigned char)(len >> 8); o[3] = (unsigned char)(len & 0xFF);
+    memcpy(o + 4, ns, sizeof ns - 1);
+    o[4 + sizeof ns - 1] = 0;
+    memcpy(o + 4 + (int)sizeof ns, x, (size_t)xl);
+    return total;
+}
+
 /* ------------------------------------------------------------ GPS → EXIF */
 /* 大疆把每帧 GPS/海拔遥测写在视频旁同名 .SRT 的字幕条目里（本机实测
  * 字段：[latitude: x] [longitude: x] [rel_alt: x abs_alt: x]，40ms/条
@@ -821,15 +1185,17 @@ static int exif_gps_app1(const SrtEntry *se, unsigned char *o, int cap) {
 }
 
 /* write one winner jpeg; app1 != NULL 时在 SOI 后注入该段; returns 0 ok */
-static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_t n,
-                      const unsigned char *app1, int app1len) {
+static int write_jpeg2(const wchar_t *dir, long long idx, const uint8_t *d, size_t n,
+                       const unsigned char *app1, int app1len,
+                       const unsigned char *xmp, int xmplen) {
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\%05lld.jpg", dir, idx);
     FILE *f = _wfopen(path, L"wb");
     if (!f) return -1;
-    if (app1 && app1len > 0 && n > 2) {
+    if ((app1 && app1len > 0 && n > 2) || (xmp && xmplen > 0)) {
         fwrite(d, 1, 2, f);              /* SOI */
-        fwrite(app1, 1, (size_t)app1len, f);
+        if (app1 && app1len > 0) fwrite(app1, 1, (size_t)app1len, f);
+        if (xmp && xmplen > 0) fwrite(xmp, 1, (size_t)xmplen, f);
         fwrite(d + 2, 1, n - 2, f);
     } else {
         fwrite(d, 1, n, f);
@@ -844,7 +1210,8 @@ static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_
  * maskp != NULL 时挂全分辨率圆形遮罩 + maskedmerge：在那唯一一次编码前
  * 把圆外清黑（无额外解码/编码遍，无二次有损编码损失）。 */
 static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
-                  const wchar_t *outdir, const wchar_t *maskp, const Telem *tm) {
+                  const wchar_t *outdir, const wchar_t *maskp, const Telem *tm,
+                  const PosTable *pt) {
     Cmd c = {0};
     cmd_add(&c, cx->ffmpeg);
     cmd_add(&c, L"-v");
@@ -923,13 +1290,21 @@ static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
                 size_t end = pos + 2;
                 if (wnext < nwin && winners[wnext].idx == n) {
                     unsigned char app1[2048];
-                    int alen = 0;
-                    if (tm) {
+                    unsigned char xmpseg[1700];
+                    int alen = 0, xlen = 0;
+                    if (pt && (size_t)n < pt->n && pt->e[n].has_pos) {
+                        /* OSV 内部 djmd：位置 + 姿态全量写入 */
+                        const PosEntry *pe = &pt->e[n];
+                        SrtEntry se = { 0, pe->lat, pe->lon, pe->rel_alt, pe->abs_alt };
+                        alen = exif_gps_app1(&se, app1, sizeof app1);
+                        if (pe->has_att) xlen = xmp_dji_app1(pe, xmpseg, sizeof xmpseg);
+                    } else if (tm) {
                         const SrtEntry *se = telem_lookup(tm, n);
                         if (se) alen = exif_gps_app1(se, app1, sizeof app1);
                     }
-                    if (write_jpeg(outdir, n, buf + start, end - start,
-                                   alen ? app1 : NULL, alen) != 0) {
+                    if (write_jpeg2(outdir, n, buf + start, end - start,
+                                    alen ? app1 : NULL, alen,
+                                    xlen ? xmpseg : NULL, xlen) != 0) {
                         LOG("pass B: cannot write jpeg %lld\n", n);
                         free(buf);
                         child_wait(&ch);
@@ -2497,6 +2872,15 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
 
     /* 大疆遥测：视频旁同名 .SRT（每帧 GPS/海拔）→ 出图时注入 EXIF。
      * 没有 SRT 行为不变。双目两路同一时刻共用同一条遥测。 */
+    PosTable pt = {0};
+    {
+        int np = djmd_load(input, &pt);
+        if (np > 0) {
+            LOG("[pos] OSV 内部 djmd: %d 帧位置+姿态; writing EXIF GPS + XMP attitude into jpegs\n", np);
+        } else {
+            LOG("[pos] no djmd track inside input (%d), falling back to .SRT\n", np);
+        }
+    }
     Telem tm = {0};
     tm.fps = fps;
     {
@@ -2649,7 +3033,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         } else {
             LOG("[track %d] pass B: writing %zu jpegs...\n", ti, nw);
         }
-        int pb = pass_b(&cx, tr, wlist, nw, dir, maskp, &tm);
+        int pb = pass_b(&cx, tr, wlist, nw, dir, maskp, &tm, &pt);
         if (maskp) { _wunlink(maskp); free(maskp); }
         if (pb == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
@@ -2658,7 +3042,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         if (hw) free(hw);
     }
     free(plan);
-    telem_free(&tm);
+    telem_free(&tm); pos_free(&pt);
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
     return rc;
 }
