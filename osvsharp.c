@@ -144,6 +144,12 @@
  *   想减小体积可到 4~5，再大画质明显下降。范围 1~31。
  * 【评分缩略图 thumb（-b，默认 512）】只影响打分速度与分数刻度，不
  *   影响输出照片的分辨率（输出永远是原始分辨率重新解码的 JPEG）。
+ *
+ * 【GPS 遥测（自动，无需参数）】视频旁有同名 .SRT（大疆导出的飞行
+ *   遥测字幕，每帧一条 [latitude/longitude/rel_alt/abs_alt]）时，每张
+ *   出图在写盘时自动注入 EXIF GPS（经纬度+海拔+UserComment 摘要），
+ *   Metashape/Pix4D 等建模软件可直接读取做地理约束；无 SRT 行为不变。
+ *   帧号→时间用探测到的帧率对齐；本代 SRT 不含姿态角，故不写姿态。
  */
 
 /* ------------------------------------------------- progress/cancel hooks */
@@ -634,13 +640,200 @@ static long long pass_a(const Ctx *cx, int track, Select *sel) {
     return i;
 }
 
-/* write one winner jpeg; returns 0 ok */
-static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_t n) {
+/* ------------------------------------------------------------ GPS → EXIF */
+/* 大疆把每帧 GPS/海拔遥测写在视频旁同名 .SRT 的字幕条目里（本机实测
+ * 字段：[latitude: x] [longitude: x] [rel_alt: x abs_alt: x]，40ms/条
+ * 与视频帧一一对应；这一代 SRT 不含姿态角，只有定位）。出图时按帧号
+ * 查到对应时刻的遥测，在写盘阶段于 SOI 后注入 APP1-Exif 段（GPS IFD +
+ * UserComment）——纯 C 手写，不重编码，像素零改动。无 SRT 行为不变。 */
+
+typedef struct { double t0, lat, lon, rel_alt, abs_alt; } SrtEntry;
+typedef struct { SrtEntry *e; size_t n; double fps; } Telem;
+
+static void telem_free(Telem *tm) { free(tm->e); tm->e = NULL; tm->n = 0; }
+
+static double srt_ts(const char *s) {   /* "00:01:02,345" -> 62.345 */
+    int h = 0, m = 0, sec = 0, ms = 0;
+    if (sscanf(s, "%d:%d:%d,%d", &h, &m, &sec, &ms) != 4) return -1.0;
+    return h * 3600.0 + m * 60.0 + sec + ms / 1000.0;
+}
+
+/* 取 "[key: value]" 里 value 的 strtod 起点；找不到返回 NULL */
+static const char *srt_field(const char *s, const char *key) {
+    const char *p = strstr(s, key);
+    if (!p) return NULL;
+    p += strlen(key);
+    while (*p == ' ') p++;
+    return p;
+}
+
+/* 解析整份 SRT，返回条目数（0 = 文件在但没有可定位条目，-1 = 打不开）*/
+static int srt_load(const wchar_t *path, Telem *tm) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (1L << 30)) { fclose(f); return 0; }
+    char *buf = malloc((size_t)sz + 1);
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = 0;
+    size_t cap = 4096, n = 0;
+    SrtEntry *e = malloc(cap * sizeof *e);
+    SrtEntry cur = {0};
+    int have_ts = 0, have_gps = 0;
+    for (char *line = buf, *nl; line; line = nl ? nl + 1 : NULL) {
+        nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        size_t L = strlen(line);
+        if (L && line[L - 1] == '\r') line[L - 1] = 0;
+        if (strstr(line, "-->")) {          /* 时间轴行 = 新条目开始 */
+            if (have_ts && have_gps) {
+                if (n == cap) { cap *= 2; e = realloc(e, cap * sizeof *e); }
+                e[n++] = cur;
+            }
+            have_ts = have_gps = 0;
+            cur = (SrtEntry){0};
+            double t = srt_ts(line);
+            if (t >= 0) { cur.t0 = t; have_ts = 1; }
+            continue;
+        }
+        const char *v;
+        /* key 不含左括号：兼容 "[ latitude:" / "(latitude:" 一类变体
+         * （strtod 自跳空格与符号），同 DJI-SRT2GeoParser 的宽松正则 */
+        if ((v = srt_field(line, "latitude:"))  != NULL) { cur.lat = strtod(v, NULL); have_gps = 1; }
+        if ((v = srt_field(line, "longitude:")) != NULL) cur.lon = strtod(v, NULL);
+        if ((v = srt_field(line, "rel_alt:"))   != NULL) cur.rel_alt = strtod(v, NULL);
+        if ((v = srt_field(line, "abs_alt:"))   != NULL) cur.abs_alt = strtod(v, NULL);
+    }
+    if (have_ts && have_gps) {
+        if (n == cap) { cap *= 2; e = realloc(e, cap * sizeof *e); }
+        e[n++] = cur;
+    }
+    free(buf);
+    tm->e = e;
+    tm->n = n;
+    return (int)n;
+}
+
+/* 帧号 -> 遥测条目。fps 已知按时间对齐（t = frame/fps，取 t0<=t 的最后
+ * 一条）；fps 未知退化为按条目序号直对（DJI SRT 首条对应视频首帧），
+ * 超出范围钳到最后一条（宁可有近似定位也不丢）。 */
+static const SrtEntry *telem_lookup(const Telem *tm, long long frame) {
+    if (!tm || tm->n == 0) return NULL;
+    size_t lo = 0, hi = tm->n - 1;
+    if (tm->fps > 0) {
+        double t = (double)frame / tm->fps;
+        /* SRT 时间戳与 t 各自有浮点舍入，边界帧（如 164*0.04 vs 164/25）
+         * 可能差一个 ULP 翻转条目，给 1/4 帧容差 */
+        double eps = 0.25 / tm->fps;
+        if (t + eps < tm->e[0].t0) return &tm->e[0];
+        while (lo < hi) {
+            size_t mid = (lo + hi + 1) / 2;
+            if (tm->e[mid].t0 <= t + eps) lo = mid; else hi = mid - 1;
+        }
+    } else {
+        lo = frame < (long long)tm->n ? (size_t)frame : tm->n - 1;
+    }
+    return &tm->e[lo];
+}
+
+static void be16(unsigned char *p, unsigned v) { p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
+static void be32(unsigned char *p, unsigned long v) {
+    p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
+}
+static void exif_entry(unsigned char *e, unsigned tag, unsigned type,
+                       unsigned cnt, unsigned val) {
+    be16(e, tag); be16(e + 2, type); be32(e + 4, cnt); be32(e + 8, val);
+}
+/* 度 -> [deg/1, min/1, sec*10000/10000] */
+static void exif_dms(unsigned char *p, double v) {
+    double a = v < 0 ? -v : v;
+    int deg = (int)a;
+    double mf = (a - deg) * 60.0;
+    int min = (int)mf;
+    unsigned long sec = (unsigned long)((mf - min) * 600000.0 + 0.5);  /* 秒×10⁴ */
+    if (sec >= 600000UL) sec = 599999UL;
+    be32(p, (unsigned long)deg); be32(p + 4, 1);
+    be32(p + 8, (unsigned long)min); be32(p + 12, 1);
+    be32(p + 16, sec); be32(p + 20, 10000);
+}
+
+/* 把一条遥测写成完整 APP1 段（FF E1 + 长度 + "Exif\0\0" + TIFF/GPS）。
+ * 布局固定：header 8 | IFD0(3 项) 42 | Exif IFD(UserComment) 18 |
+ * GPS IFD(7 项) 90 | 数据区（度分秒 56B + 描述串 + 注释串）。
+ * 返回段总字节数；0 = 无有效坐标，不注入。 */
+static int exif_gps_app1(const SrtEntry *se, unsigned char *o, int cap) {
+    if (se->lat == 0.0 && se->lon == 0.0) return 0;   /* 无定位不伪造 */
+    char desc[200], ucom[160];
+    _snprintf(desc, sizeof desc,
+              "DJI telemetry: lat %.6f lon %.6f rel_alt %.2f m abs_alt %.2f m",
+              se->lat, se->lon, se->rel_alt, se->abs_alt);
+    _snprintf(ucom, sizeof ucom, "lat %.6f lon %.6f rel_alt %.2f abs_alt %.2f",
+              se->lat, se->lon, se->rel_alt, se->abs_alt);
+    int ndesc = (int)strlen(desc) + 1;
+    int ncom = 8 + (int)strlen(ucom) + 1;             /* "ASCII\0\0\0" + 文本 */
+
+    int ifd0 = 8, exif_ifd = ifd0 + 42, gps_ifd = exif_ifd + 18;
+    int r1 = gps_ifd + 90, r2 = r1 + 24, r3 = r2 + 24;
+    int doff = r3 + 8, coff = doff + ((ndesc + 1) & ~1);
+    int tiff_end = coff + ((ncom + 1) & ~1);
+    int payload = 6 + tiff_end;
+    int total = 4 + payload;                          /* FF E1 + 段长 + payload */
+    if (total > cap || payload > 65533) return 0;
+
+    memcpy(o, "\xFF\xE1", 2);
+    be16(o + 2, (unsigned)(payload + 2));
+    memcpy(o + 4, "Exif\0\0", 6);
+    unsigned char *t = o + 10;
+    memcpy(t, "MM\0*\0\0\0\x08", 8);
+    unsigned char *i0 = t + ifd0;
+    be16(i0, 3);
+    exif_entry(i0 + 2,  0x010E, 2, (unsigned)ndesc, (unsigned long)doff);   /* ImageDescription */
+    exif_entry(i0 + 14, 0x8769, 4, 1, (unsigned long)exif_ifd);             /* Exif IFD pointer */
+    exif_entry(i0 + 26, 0x8825, 4, 1, (unsigned long)gps_ifd);              /* GPS IFD pointer */
+    be32(i0 + 38, 0);
+    unsigned char *ie = t + exif_ifd;
+    be16(ie, 1);
+    exif_entry(ie + 2, 0x9286, 7, (unsigned)ncom, (unsigned long)coff);     /* UserComment */
+    be32(ie + 14, 0);
+    unsigned char *ig = t + gps_ifd;
+    be16(ig, 7);
+    exif_entry(ig + 2,  0x0000, 1, 4, 0x02020000);                          /* GPSVersionID inline */
+    exif_entry(ig + 14, 0x0001, 2, 2, se->lat >= 0 ? 0x4E000000 : 0x53000000); /* 'N'/'S' */
+    exif_entry(ig + 26, 0x0002, 5, 3, (unsigned long)r1);                   /* GPSLatitude */
+    exif_entry(ig + 38, 0x0003, 2, 2, se->lon >= 0 ? 0x45000000 : 0x57000000); /* 'E'/'W' */
+    exif_entry(ig + 50, 0x0004, 5, 3, (unsigned long)r2);                   /* GPSLongitude */
+    exif_entry(ig + 62, 0x0005, 1, 1, se->abs_alt >= 0 ? 0 : 1);            /* AltitudeRef */
+    exif_entry(ig + 74, 0x0006, 5, 1, (unsigned long)r3);                   /* GPSAltitude */
+    be32(ig + 86, 0);
+    double alt = se->abs_alt < 0 ? -se->abs_alt : se->abs_alt;
+    be32(t + r3, (unsigned long)(alt * 100.0 + 0.5));
+    be32(t + r3 + 4, 100);
+    exif_dms(t + r1, se->lat);
+    exif_dms(t + r2, se->lon);
+    memcpy(t + doff, desc, (size_t)ndesc);
+    memcpy(t + coff, "ASCII\0\0\0", 8);
+    memcpy(t + coff + 8, ucom, (size_t)ncom - 8);
+    return total;
+}
+
+/* write one winner jpeg; app1 != NULL 时在 SOI 后注入该段; returns 0 ok */
+static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_t n,
+                      const unsigned char *app1, int app1len) {
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\%05lld.jpg", dir, idx);
     FILE *f = _wfopen(path, L"wb");
     if (!f) return -1;
-    fwrite(d, 1, n, f);
+    if (app1 && app1len > 0 && n > 2) {
+        fwrite(d, 1, 2, f);              /* SOI */
+        fwrite(app1, 1, (size_t)app1len, f);
+        fwrite(d + 2, 1, n - 2, f);
+    } else {
+        fwrite(d, 1, n, f);
+    }
     fclose(f);
     return 0;
 }
@@ -651,7 +844,7 @@ static int write_jpeg(const wchar_t *dir, long long idx, const uint8_t *d, size_
  * maskp != NULL 时挂全分辨率圆形遮罩 + maskedmerge：在那唯一一次编码前
  * 把圆外清黑（无额外解码/编码遍，无二次有损编码损失）。 */
 static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
-                  const wchar_t *outdir, const wchar_t *maskp) {
+                  const wchar_t *outdir, const wchar_t *maskp, const Telem *tm) {
     Cmd c = {0};
     cmd_add(&c, cx->ffmpeg);
     cmd_add(&c, L"-v");
@@ -729,7 +922,14 @@ static int pass_b(const Ctx *cx, int track, const Cand *winners, size_t nwin,
                 if (pos + 1 >= len) break;
                 size_t end = pos + 2;
                 if (wnext < nwin && winners[wnext].idx == n) {
-                    if (write_jpeg(outdir, n, buf + start, end - start) != 0) {
+                    unsigned char app1[2048];
+                    int alen = 0;
+                    if (tm) {
+                        const SrtEntry *se = telem_lookup(tm, n);
+                        if (se) alen = exif_gps_app1(se, app1, sizeof app1);
+                    }
+                    if (write_jpeg(outdir, n, buf + start, end - start,
+                                   alen ? app1 : NULL, alen) != 0) {
                         LOG("pass B: cannot write jpeg %lld\n", n);
                         free(buf);
                         child_wait(&ch);
@@ -888,7 +1088,7 @@ static wchar_t *find_ffmpeg(const wchar_t *ffmpeg_arg);
 static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem);
 static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
                                int *idx, int *ws, int *hs, int maxn,
-                               int *nattach);
+                               int *nattach, double *fps_out);
 static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
                          const wchar_t *outdir, int skip, int keep,
                          double min_score, double diff_th, int min_gap,
@@ -1535,7 +1735,7 @@ static DWORD WINAPI test_worker(LPVOID argp) {
     TestSheet ts;
     memset(&ts, 0, sizeof(ts));
     int idx[4], ws[4], hs[4], nattach = 0;
-    int nreal = probe_video_streams(ffmpeg, path, idx, ws, hs, 4, &nattach);
+    int nreal = probe_video_streams(ffmpeg, path, idx, ws, hs, 4, &nattach, NULL);
     int ntracks = nreal > 0 ? (nreal > 2 ? 2 : nreal) : 1;
     int failed = 0;
     if (nreal <= 0 || ws[0] <= 0 || hs[0] <= 0) {
@@ -2056,7 +2256,9 @@ static void usage(void) {
         "  files like .OSV; attached-pic cover streams are ignored).\n"
         "  Two-stream files share one extraction plan measured on track 0:\n"
         "  cam0/cam1 output identical frame numbers (exact stereo pairing);\n"
-        "  only cam0 gets a sharpness CSV.\n\n"
+        "  only cam0 gets a sharpness CSV.\n"
+        "  GPS: a matching .SRT (DJI telemetry, per-frame) beside the video\n"
+        "  is written into every jpeg as EXIF automatically; no SRT = no change.\n\n"
         "  -s, --skip <n>       抽帧间隔：每 n 个源帧输出 1 张（默认 8）\n"
         "  -k, --keep <n>       锐度窗口：每组末尾 n 帧里挑最清晰的一张\n"
         "                       （默认 skip/2；0 = 不挑，固定取每组第 1 帧）\n"
@@ -2114,9 +2316,12 @@ static wchar_t *find_ffmpeg(const wchar_t *ffmpeg_arg) {
     return _wcsdup(env ? env : L"ffmpeg");
 }
 
-/* "D:\\a\\b.MP4" -> dir="D:\\a" stem="b" */
+/* "D:\\a\\b.MP4" -> dir="D:\\a" stem="b"；正斜杠路径（Git Bash/脚本
+ * 传参）也认，否则 SRT 同名探测等按目录拼接的逻辑会拼错 */
 static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem) {
     const wchar_t *slash = wcsrchr(path, L'\\');
+    const wchar_t *fslash = wcsrchr(path, L'/');
+    if (!slash || (fslash && fslash > slash)) slash = fslash;
     const wchar_t *base = slash ? slash + 1 : path;
     const wchar_t *dot = wcsrchr(base, L'.');
     size_t dirlen = slash ? (size_t)(slash - path) : 0;
@@ -2138,7 +2343,7 @@ static void split_stem(const wchar_t *path, wchar_t *dir, wchar_t *stem) {
  * (caller then falls back to the old assume-two-tracks behaviour). */
 static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
                                int *idx, int *ws, int *hs, int maxn,
-                               int *nattach) {
+                               int *nattach, double *fps_out) {
     *nattach = 0;
     Cmd c = {0};
     cmd_add(&c, ffmpeg);
@@ -2163,6 +2368,7 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
 
     int n = 0, nat = 0, parsed = 0;
     char *line = buf;
+    double fpsv = 0.0;
     while (line) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
@@ -2188,6 +2394,19 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
                         }
                         q++;
                     }
+                    /* 顺手抓 ", 25 fps"（GPS 遥测按帧号→时间对齐 SRT 用）*/
+                    if (fpsv <= 0.0) {
+                        const char *fp = strstr(sp, "fps");
+                        if (fp) {
+                            const char *p = fp;
+                            while (p > sp && p[-1] == ' ') p--;
+                            const char *q2 = p;
+                            while (q2 > sp && ((q2[-1] >= '0' && q2[-1] <= '9')
+                                               || q2[-1] == '.'))
+                                q2--;
+                            if (p > q2) fpsv = strtod(q2, NULL);
+                        }
+                    }
                     n++;
                 }
             }
@@ -2195,6 +2414,7 @@ static int probe_video_streams(const wchar_t *ffmpeg, const wchar_t *input,
         line = nl ? nl + 1 : NULL;
     }
     free(buf);
+    if (fps_out) *fps_out = fpsv;
     *nattach = nat;
     return parsed ? n : -1;
 }
@@ -2253,9 +2473,11 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
      * 流列表解析失败时退回老行为（假定 0、1 两条轨）。 */
     int tracks[2] = { 0, 1 }, ntracks = 2;
     int tw[2] = { 0, 0 }, th[2] = { 0, 0 };   /* 每轨分辨率（涂黑遮罩用） */
+    double fps = 0.0;   /* 首条真实视频流的帧率（GPS 遥测按时间对齐用） */
     {
-        int vsidx[4], vsw[4], vsh[4], nattach = 0;
-        int nreal = probe_video_streams(ffmpeg, input, vsidx, vsw, vsh, 4, &nattach);
+    int vsidx[4], vsw[4], vsh[4], nattach = 0;
+    int nreal = probe_video_streams(ffmpeg, input, vsidx, vsw, vsh, 4, &nattach,
+                                    &fps);
         if (nreal > 0) {
             ntracks = nreal > 2 ? 2 : nreal;
             tracks[0] = vsidx[0];
@@ -2272,6 +2494,25 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
      * 但文件仍是鱼眼双目，涂黑照常）；单流普通视频没有鱼眼圆外
      * 黑边，涂黑几何不适用，自动跳过。 */
     int dual = ntracks > 1;
+
+    /* 大疆遥测：视频旁同名 .SRT（每帧 GPS/海拔）→ 出图时注入 EXIF。
+     * 没有 SRT 行为不变。双目两路同一时刻共用同一条遥测。 */
+    Telem tm = {0};
+    tm.fps = fps;
+    {
+        wchar_t vdir[MAX_PATH], vstem[MAX_PATH], srtp[MAX_PATH * 2];
+        split_stem(input, vdir, vstem);
+        _snwprintf(srtp, MAX_PATH * 2, L"%ls\\%ls.srt", vdir, vstem);
+        int ntm = srt_load(srtp, &tm);
+        if (ntm > 0) {
+            char *s8 = w_to_utf8(vstem);
+            LOG("[gps] %s.srt: %d telemetry entries%s; writing EXIF GPS into jpegs\n",
+                s8, ntm, fps > 0 ? "" : " (fps unknown, aligning by entry index)");
+            free(s8);
+        } else {
+            LOG("[gps] no usable .SRT beside input, jpegs without EXIF GPS\n");
+        }
+    }
     if (track >= 0) {
         if (track < ntracks) {
             tracks[0] = tracks[track]; tw[0] = tw[track]; th[0] = th[track];
@@ -2408,7 +2649,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         } else {
             LOG("[track %d] pass B: writing %zu jpegs...\n", ti, nw);
         }
-        int pb = pass_b(&cx, tr, wlist, nw, dir, maskp);
+        int pb = pass_b(&cx, tr, wlist, nw, dir, maskp, &tm);
         if (maskp) { _wunlink(maskp); free(maskp); }
         if (pb == -2) { rc = 2; sel_free(&sel); free(dir); if (hw) free(hw); break; }
         if (pb != 0) rc = 1;
@@ -2417,6 +2658,7 @@ static int process_input(const wchar_t *ffmpeg, const wchar_t *input,
         if (hw) free(hw);
     }
     free(plan);
+    telem_free(&tm);
     LOG("finished in %.1f s\n", (GetTickCount64() - t0) / 1000.0);
     return rc;
 }
